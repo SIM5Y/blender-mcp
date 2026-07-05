@@ -20,14 +20,13 @@ Give feedback, get inspired, and build on top of the MCP: [Discord](https://disc
 
 [Support this project](https://github.com/sponsors/ahujasid)
 
-## Current version(1.5.5)
-- Added Hunyuan3D support
-- View screenshots for Blender viewport to better understand the scene
-- Search and download Sketchfab models
-- Support for Poly Haven assets through their API
-- Support to generate 3D models using Hyper3D Rodin
-- Run Blender MCP on a remote host
-- Telemetry for tools executed (completely anonymous)
+## Current version(1.7.0)
+- Structured tools for modelling, animation, cameras, rendering, and export — no hand-written Python needed for common operations
+- REPL-style code execution with persistent namespace, scene diffs, and optional rollback on error
+- Undo checkpoints before every AI mutation, plus an "Undo AI Action" button in the Blender panel
+- Activity log and Pause/Resume switch in the BlenderMCP sidebar panel
+- API keys (Sketchfab, Hyper3D, Hunyuan3D) moved to addon preferences — no longer saved in .blend files
+- Reliability fixes: base64 viewport screenshots (works on remote hosts), thread-safe connection, faster liveness checks
 
 ### Installating a new version (existing users)
 - For newcomers, you can go straight to Installation. For existing users, see the points below
@@ -38,10 +37,13 @@ Give feedback, get inspired, and build on top of the MCP: [Discord](https://disc
 ## Features
 
 - **Two-way communication**: Connect Claude AI to Blender through a socket-based server
-- **Object manipulation**: Create, modify, and delete 3D objects in Blender
-- **Material control**: Apply and modify materials and colors
-- **Scene inspection**: Get detailed information about the current Blender scene
-- **Code execution**: Run arbitrary Python code in Blender from Claude
+- **Structured modelling tools**: Transform and place objects, manage modifiers, boolean operations, collections, parenting
+- **Animation tools**: Timeline control, keyframes, interpolation/easing, animation introspection
+- **Cameras & rendering**: Camera framing and presets, multi-angle previews, animation previews, full renders
+- **Scene inspection**: Filterable, paginated scene graph plus detailed per-object info
+- **Code execution**: Run arbitrary Python code in Blender with REPL semantics, scene diffs, and rollback on error
+- **Pipeline**: Export (glTF/FBX/OBJ/USD), import local assets, save/version .blend projects
+- **Safety & control**: Undo checkpoints for AI actions, pause switch, and activity log in the Blender panel
 
 ## Components
 
@@ -215,10 +217,13 @@ Once the config file has been set on Claude, and the addon is running on Blender
 
 #### Capabilities
 
-- Get scene and object information 
-- Create, delete and modify shapes
+- Inspect scenes and objects (scene graph with filters and pagination, detailed object info)
+- Create, delete, transform, and place objects; manage modifiers, booleans, and collections
+- Animate with keyframes, interpolation control, and timeline management
+- Frame and position cameras, render previews from multiple angles, and produce full renders
 - Apply or create materials for objects
-- Execute any Python code in Blender
+- Execute any Python code in Blender, with scene diffs and optional rollback on error
+- Export scenes (glTF/FBX/OBJ/USD), import local assets, and save/version projects
 - Download the right models, assets and HDRIs through [Poly Haven](https://polyhaven.com/)
 - AI generated 3D models through [Hyper3D Rodin](https://hyper3d.ai/)
 
@@ -260,7 +265,7 @@ The system uses a simple JSON-based protocol over TCP sockets:
 
 ## Limitations & Security Considerations
 
-- The `execute_blender_code` tool allows running arbitrary Python code in Blender, which can be powerful but potentially dangerous. Use with caution in production environments. ALWAYS save your work before using it.
+- The `execute_blender_code` tool allows running arbitrary Python code in Blender, which can be powerful but potentially dangerous. Use with caution in production environments. ALWAYS save your work before using it. The tool supports a `rollback_on_error` flag that undoes the change if the code fails, and every AI mutation pushes an undo checkpoint — you can revert the last AI action with the "Undo AI Action" button in the BlenderMCP panel or plain Ctrl+Z.
 - Poly Haven requires downloading models, textures, and HDRI images. If you do not want to use it, please turn it off in the checkbox in Blender. 
 - Complex operations might need to be broken down into smaller steps
 

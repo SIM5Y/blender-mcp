@@ -1,7 +1,11 @@
 # Code created by Siddharth Ahuja: www.github.com/ahujasid © 2025
 
 import re
+import ast
 import bpy
+import math
+import random
+import collections
 import mathutils
 import json
 import threading
@@ -13,7 +17,7 @@ import traceback
 import os
 import shutil
 import zipfile
-from bpy.props import IntProperty, BoolProperty
+from bpy.props import IntProperty, BoolProperty, StringProperty
 import io
 from datetime import datetime
 import hashlib, hmac, base64
@@ -23,14 +27,92 @@ from contextlib import redirect_stdout, suppress
 bl_info = {
     "name": "Blender MCP",
     "author": "BlenderMCP",
-    "version": (1, 2),
+    "version": (1, 7, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > BlenderMCP",
     "description": "Connect Blender to Claude via MCP",
     "category": "Interface",
 }
 
+ADDON_VERSION = "1.7.0"
+
 RODIN_FREE_TRIAL_KEY = "vibecoding"
+
+# Commands that modify the scene: an undo checkpoint is pushed before each one
+# so undo_last / rollback_on_error can revert the change.
+MUTATING_COMMANDS = {
+    "execute_code",
+    "set_transform",
+    "place_object",
+    "manage_modifiers",
+    "boolean_op",
+    "organize_scene",
+    "set_keyframes",
+    "delete_keyframes",
+    "set_keyframe_interpolation",
+    "manage_timeline",
+    "import_local_asset",
+    # Integration commands that modify the scene
+    "download_polyhaven_asset",
+    "set_texture",
+    "download_sketchfab_model",
+    "import_generated_asset",
+    "import_generated_asset_hunyuan",
+}
+
+# Valid keyframe interpolation / easing identifiers (Blender 4.2+ and 5.x)
+KEYFRAME_INTERPOLATIONS = {
+    "CONSTANT", "LINEAR", "BEZIER", "SINE", "QUAD", "CUBIC", "QUART",
+    "QUINT", "EXPO", "CIRC", "BACK", "BOUNCE", "ELASTIC",
+}
+KEYFRAME_EASINGS = {"AUTO", "EASE_IN", "EASE_OUT", "EASE_IN_OUT"}
+
+# Camera preset view directions: vectors pointing from the framed target
+# toward the camera (normalized before use).
+CAMERA_PRESETS = {
+    "front": (0.0, -1.0, 0.0),
+    "right": (1.0, 0.0, 0.0),
+    "top": (0.0, 0.0, 1.0),
+    "isometric": (1.0, -1.0, 0.8),
+    "three_quarter": (1.0, -1.0, 0.35),
+}
+
+# Persistent namespace for execute_code REPL semantics (lazily initialized)
+_EXEC_NAMESPACE = None
+
+def _init_exec_namespace():
+    """Build a fresh execution namespace for execute_code."""
+    import bmesh
+    from mathutils import Vector, Matrix, Euler, Quaternion
+    return {
+        "bpy": bpy,
+        "bmesh": bmesh,
+        "mathutils": mathutils,
+        "math": math,
+        "json": json,
+        "random": random,
+        "Vector": Vector,
+        "Matrix": Matrix,
+        "Euler": Euler,
+        "Quaternion": Quaternion,
+    }
+
+def get_credential(context, pref_name, scene_prop_name):
+    """Read an API credential.
+
+    Addon preferences win (stored in Blender's user config, not in .blend
+    files); the legacy per-scene property is kept as a fallback so existing
+    setups keep working.
+    """
+    try:
+        addon_entry = context.preferences.addons.get(__name__)
+        if addon_entry:
+            value = getattr(addon_entry.preferences, pref_name, "")
+            if value:
+                return value
+    except (AttributeError, KeyError):
+        pass
+    return getattr(context.scene, scene_prop_name, "")
 
 # Add User-Agent as required by Poly Haven API
 REQ_HEADERS = requests.utils.default_headers()
@@ -43,6 +125,16 @@ class BlenderMCPServer:
         self.running = False
         self.socket = None
         self.server_thread = None
+        # Status tracking (read by the UI panel)
+        self.active_client = None
+        self.client_connected = False
+        self.client_address = None
+        self.last_command_type = None
+        self.last_command_time = None
+        self.last_error = None  # {"time", "command", "message"} or None
+        self.commands_executed = 0
+        self.executing = False
+        self.activity_log = collections.deque(maxlen=50)
 
     def start(self):
         if self.running:
@@ -70,6 +162,16 @@ class BlenderMCPServer:
 
     def stop(self):
         self.running = False
+
+        # Close any active client connection
+        if self.active_client:
+            try:
+                self.active_client.close()
+            except:
+                pass
+            self.active_client = None
+        self.client_connected = False
+        self.client_address = None
 
         # Close socket
         if self.socket:
@@ -102,10 +204,23 @@ class BlenderMCPServer:
                     client, address = self.socket.accept()
                     print(f"Connected to client: {address}")
 
+                    # Single active client: adopt the new connection,
+                    # closing any previous client (its handler will exit).
+                    if self.active_client is not None:
+                        print(f"New client connected - closing previous client {self.client_address}")
+                        try:
+                            self.active_client.close()
+                        except:
+                            pass
+                    self.active_client = client
+                    self.client_connected = True
+                    self.client_address = f"{address[0]}:{address[1]}"
+                    self._redraw_ui()
+
                     # Handle client in a separate thread
                     client_thread = threading.Thread(
                         target=self._handle_client,
-                        args=(client,)
+                        args=(client, address)
                     )
                     client_thread.daemon = True
                     client_thread.start()
@@ -123,7 +238,7 @@ class BlenderMCPServer:
 
         print("Server thread stopped")
 
-    def _handle_client(self, client):
+    def _handle_client(self, client, address=None):
         """Handle connected client"""
         print("Client handler started")
         client.settimeout(None)  # No timeout
@@ -146,6 +261,22 @@ class BlenderMCPServer:
 
                         # Execute command in Blender's main thread
                         def execute_wrapper():
+                            cmd_type = command.get("type")
+                            start_time = time.time()
+                            self.executing = True
+                            self.last_command_type = cmd_type
+                            self.last_command_time = start_time
+
+                            # Push an undo checkpoint before mutating commands
+                            # (skipped while paused - the command will be rejected anyway)
+                            if cmd_type in MUTATING_COMMANDS and \
+                                    not getattr(bpy.context.scene, "blendermcp_paused", False):
+                                try:
+                                    bpy.ops.ed.undo_push(message=f"MCP: {cmd_type}")
+                                except Exception as undo_err:
+                                    print(f"Undo push failed: {str(undo_err)}")
+
+                            response = None
                             try:
                                 response = self.execute_command(command)
                                 response_json = json.dumps(response)
@@ -156,14 +287,21 @@ class BlenderMCPServer:
                             except Exception as e:
                                 print(f"Error executing command: {str(e)}")
                                 traceback.print_exc()
+                                response = {
+                                    "status": "error",
+                                    "message": str(e)
+                                }
                                 try:
-                                    error_response = {
-                                        "status": "error",
-                                        "message": str(e)
-                                    }
-                                    client.sendall(json.dumps(error_response).encode('utf-8'))
+                                    client.sendall(json.dumps(response).encode('utf-8'))
                                 except:
                                     pass
+                            finally:
+                                self.executing = False
+                                try:
+                                    self._log_activity(cmd_type, command, response, start_time)
+                                except Exception:
+                                    pass
+                                self._redraw_ui()
                             return None
 
                         # Schedule execution in main thread
@@ -181,7 +319,70 @@ class BlenderMCPServer:
                 client.close()
             except:
                 pass
+            # Only clear connection status if we are still the active client
+            # (a newer connection may already have been adopted)
+            if self.active_client is client:
+                self.active_client = None
+                self.client_connected = False
+                self.client_address = None
+                self._redraw_ui()
             print("Client handler stopped")
+
+    def _log_activity(self, cmd_type, command, response, start_time):
+        """Record a command execution in the activity log (read by the UI panel)"""
+        duration_ms = int((time.time() - start_time) * 1000)
+        # Handlers may report partial/external failures as {"error": ...} inside
+        # a status='success' envelope (e.g. disabled integrations) - surface
+        # those as errors in the log / last_error too.
+        handler_error = None
+        if isinstance(response, dict) and isinstance(response.get("result"), dict) \
+                and "error" in response["result"]:
+            handler_error = str(response["result"]["error"])
+        status = "ok" if isinstance(response, dict) and response.get("status") == "success" \
+            and handler_error is None else "error"
+        summary = cmd_type or "?"
+        if cmd_type == "execute_code":
+            code = (command.get("params") or {}).get("code", "")
+            first_line = code.splitlines()[0].strip() if code else ""
+            if first_line:
+                summary = first_line
+        summary = summary[:120]
+        self.commands_executed += 1
+        if status == "error":
+            message = handler_error or \
+                (response.get("message", "") if isinstance(response, dict) else "")
+            self.last_error = {
+                "time": time.time(),
+                "command": cmd_type,
+                "message": message,
+            }
+        self.activity_log.append({
+            "time": time.strftime("%H:%M:%S"),
+            "type": cmd_type,
+            "status": status,
+            "duration_ms": duration_ms,
+            "summary": summary,
+        })
+
+    def _redraw_ui(self):
+        """Tag all 3D viewports for redraw so the panel status updates.
+
+        Safe to call from any thread: the actual tagging is scheduled
+        on Blender's main thread via a timer.
+        """
+        def _tag():
+            try:
+                for w in bpy.context.window_manager.windows:
+                    for a in w.screen.areas:
+                        if a.type == 'VIEW_3D':
+                            a.tag_redraw()
+            except Exception:
+                pass
+            return None
+        try:
+            bpy.app.timers.register(_tag, first_interval=0.0)
+        except Exception:
+            pass
 
     def execute_command(self, command):
         """Execute a command in the main Blender thread"""
@@ -193,64 +394,84 @@ class BlenderMCPServer:
             traceback.print_exc()
             return {"status": "error", "message": str(e)}
 
+    def _get_handlers(self):
+        """Build the full command handler registry.
+
+        Every command handler must be registered here. Integration handlers
+        are always registered; each one starts with a guard that returns an
+        actionable error when its integration is disabled.
+        """
+        return {
+            # Always available (also allowed while paused)
+            "ping": self.ping,
+            "get_capabilities": self.get_capabilities,
+            "get_telemetry_consent": self.get_telemetry_consent,
+            # Core
+            "get_scene_info": self.get_scene_info,
+            "get_scene_graph": self.get_scene_graph,
+            "get_object_info": self.get_object_info,
+            "get_viewport_screenshot": self.get_viewport_screenshot,
+            "execute_code": self.execute_code,
+            "undo_last": self.undo_last,
+            # Modelling
+            "set_transform": self.set_transform,
+            "place_object": self.place_object,
+            "manage_modifiers": self.manage_modifiers,
+            "boolean_op": self.boolean_op,
+            "organize_scene": self.organize_scene,
+            # Animation
+            "manage_timeline": self.manage_timeline,
+            "set_keyframes": self.set_keyframes,
+            "delete_keyframes": self.delete_keyframes,
+            "set_keyframe_interpolation": self.set_keyframe_interpolation,
+            "get_animation_info": self.get_animation_info,
+            # Cameras & rendering
+            "set_camera": self.set_camera,
+            "render_preview": self.render_preview,
+            "render_animation_preview": self.render_animation_preview,
+            "render_image": self.render_image,
+            # Pipeline
+            "export_scene": self.export_scene,
+            "import_local_asset": self.import_local_asset,
+            "manage_project": self.manage_project,
+            # Integration status
+            "get_polyhaven_status": self.get_polyhaven_status,
+            "get_hyper3d_status": self.get_hyper3d_status,
+            "get_sketchfab_status": self.get_sketchfab_status,
+            "get_hunyuan3d_status": self.get_hunyuan3d_status,
+            # PolyHaven
+            "get_polyhaven_categories": self.get_polyhaven_categories,
+            "search_polyhaven_assets": self.search_polyhaven_assets,
+            "download_polyhaven_asset": self.download_polyhaven_asset,
+            "set_texture": self.set_texture,
+            # Hyper3D Rodin
+            "create_rodin_job": self.create_rodin_job,
+            "poll_rodin_job_status": self.poll_rodin_job_status,
+            "import_generated_asset": self.import_generated_asset,
+            # Sketchfab
+            "search_sketchfab_models": self.search_sketchfab_models,
+            "get_sketchfab_model_preview": self.get_sketchfab_model_preview,
+            "download_sketchfab_model": self.download_sketchfab_model,
+            # Hunyuan3D
+            "create_hunyuan_job": self.create_hunyuan_job,
+            "poll_hunyuan_job_status": self.poll_hunyuan_job_status,
+            "import_generated_asset_hunyuan": self.import_generated_asset_hunyuan,
+        }
+
     def _execute_command_internal(self, command):
         """Internal command execution with proper context"""
         cmd_type = command.get("type")
         params = command.get("params", {})
 
-        # Add a handler for checking PolyHaven status
-        if cmd_type == "get_polyhaven_status":
-            return {"status": "success", "result": self.get_polyhaven_status()}
-
-        # Base handlers that are always available
-        handlers = {
-            "get_scene_info": self.get_scene_info,
-            "get_object_info": self.get_object_info,
-            "get_viewport_screenshot": self.get_viewport_screenshot,
-            "execute_code": self.execute_code,
-            "get_telemetry_consent": self.get_telemetry_consent,
-            "get_polyhaven_status": self.get_polyhaven_status,
-            "get_hyper3d_status": self.get_hyper3d_status,
-            "get_sketchfab_status": self.get_sketchfab_status,
-            "get_hunyuan3d_status": self.get_hunyuan3d_status,
-        }
-
-        # Add Polyhaven handlers only if enabled
-        if bpy.context.scene.blendermcp_use_polyhaven:
-            polyhaven_handlers = {
-                "get_polyhaven_categories": self.get_polyhaven_categories,
-                "search_polyhaven_assets": self.search_polyhaven_assets,
-                "download_polyhaven_asset": self.download_polyhaven_asset,
-                "set_texture": self.set_texture,
+        # Pause switch: reject everything except lightweight status commands
+        if getattr(bpy.context.scene, "blendermcp_paused", False) and \
+                cmd_type not in ("ping", "get_capabilities", "get_telemetry_consent"):
+            return {
+                "status": "error",
+                "message": "Paused by the user in Blender. Stop and tell the user to press Resume in the BlenderMCP panel."
             }
-            handlers.update(polyhaven_handlers)
 
-        # Add Hyper3d handlers only if enabled
-        if bpy.context.scene.blendermcp_use_hyper3d:
-            polyhaven_handlers = {
-                "create_rodin_job": self.create_rodin_job,
-                "poll_rodin_job_status": self.poll_rodin_job_status,
-                "import_generated_asset": self.import_generated_asset,
-            }
-            handlers.update(polyhaven_handlers)
-
-        # Add Sketchfab handlers only if enabled
-        if bpy.context.scene.blendermcp_use_sketchfab:
-            sketchfab_handlers = {
-                "search_sketchfab_models": self.search_sketchfab_models,
-                "get_sketchfab_model_preview": self.get_sketchfab_model_preview,
-                "download_sketchfab_model": self.download_sketchfab_model,
-            }
-            handlers.update(sketchfab_handlers)
-        
-        # Add Hunyuan3d handlers only if enabled
-        if bpy.context.scene.blendermcp_use_hunyuan3d:
-            hunyuan_handlers = {
-                "create_hunyuan_job": self.create_hunyuan_job,
-                "poll_hunyuan_job_status": self.poll_hunyuan_job_status,
-                "import_generated_asset_hunyuan": self.import_generated_asset_hunyuan
-            }
-            handlers.update(hunyuan_handlers)
+        handlers = self._get_handlers()
 
         handler = handlers.get(cmd_type)
         if handler:
@@ -266,23 +487,81 @@ class BlenderMCPServer:
         else:
             return {"status": "error", "message": f"Unknown command type: {cmd_type}"}
 
+    def ping(self):
+        """Lightweight liveness check (allowed while paused)"""
+        return {"pong": True, "addon_version": ADDON_VERSION, "protocol": 1}
 
+    def get_capabilities(self):
+        """Report addon version, Blender version, integration toggles and available commands"""
+        scene = bpy.context.scene
+        return {
+            "addon_version": ADDON_VERSION,
+            "protocol": 1,
+            "blender_version": list(bpy.app.version),
+            "integrations": {
+                "polyhaven": bool(getattr(scene, "blendermcp_use_polyhaven", False)),
+                "hyper3d": bool(getattr(scene, "blendermcp_use_hyper3d", False)),
+                "sketchfab": bool(getattr(scene, "blendermcp_use_sketchfab", False)),
+                "hunyuan3d": bool(getattr(scene, "blendermcp_use_hunyuan3d", False)),
+            },
+            "commands": sorted(self._get_handlers().keys()),
+        }
+
+    def undo_last(self):
+        """Undo the last operation (MCP mutating commands push undo checkpoints)"""
+        try:
+            # ed.undo() restores the snapshot of the step BEFORE the active one.
+            # The checkpoints pushed in execute_wrapper capture PRE-command state,
+            # so first push a step capturing the CURRENT (post-command) state;
+            # a single undo then lands exactly on the last pre-command snapshot.
+            try:
+                bpy.ops.ed.undo_push(message="MCP: undo_last")
+            except Exception:
+                pass
+            bpy.ops.ed.undo()
+        except Exception as e:
+            raise Exception(f"Undo failed: {str(e)}")
+        return {"undone": True}
+
+    def _integration_disabled_error(self, scene_prop, label):
+        """Return a disabled-error dict if the integration toggle is off, else None"""
+        if not getattr(bpy.context.scene, scene_prop, False):
+            return {"error": f"{label} is disabled. Ask the user to enable it in the BlenderMCP sidebar panel in Blender."}
+        return None
 
     def get_scene_info(self):
         """Get information about the current Blender scene"""
         try:
             print("Getting scene info...")
+            scene = bpy.context.scene
+            try:
+                mode = bpy.context.mode
+            except Exception:
+                mode = "OBJECT"
+            try:
+                active_object = bpy.context.active_object.name if bpy.context.active_object else None
+                selected_objects = [o.name for o in bpy.context.selected_objects][:20]
+            except Exception:
+                active_object = None
+                selected_objects = []
             # Simplify the scene info to reduce data size
             scene_info = {
-                "name": bpy.context.scene.name,
-                "object_count": len(bpy.context.scene.objects),
+                "name": scene.name,
+                "object_count": len(scene.objects),
                 "objects": [],
                 "materials_count": len(bpy.data.materials),
+                "frame_start": scene.frame_start,
+                "frame_end": scene.frame_end,
+                "fps": scene.render.fps,
+                "frame_current": scene.frame_current,
+                "mode": mode,
+                "active_object": active_object,
+                "selected_objects": selected_objects,
             }
 
-            # Collect minimal object information (limit to first 10 objects)
-            for i, obj in enumerate(bpy.context.scene.objects):
-                if i >= 10:  # Reduced from 20 to 10
+            # Collect minimal object information (limit to first 20 objects)
+            for i, obj in enumerate(scene.objects):
+                if i >= 20:
                     break
 
                 obj_info = {
@@ -322,13 +601,210 @@ class BlenderMCPServer:
             [*min_corner], [*max_corner]
         ]
 
+    @staticmethod
+    def _get_world_aabb(objs):
+        """World-space AABB spanning one or more objects of any type.
 
+        Unlike _get_aabb this accepts non-mesh objects (their display
+        bound_box is used; objects without a usable bound_box contribute
+        their origin point). Returns [[min_x,min_y,min_z],[max_x,max_y,max_z]].
+        """
+        if not isinstance(objs, (list, tuple)):
+            objs = [objs]
+        corners = []
+        for obj in objs:
+            try:
+                local_corners = [mathutils.Vector(c) for c in obj.bound_box]
+                corners.extend(obj.matrix_world @ c for c in local_corners)
+            except Exception:
+                corners.append(obj.matrix_world.translation.copy())
+        if not corners:
+            raise ValueError("No objects to compute a bounding box from.")
+        min_corner = mathutils.Vector(map(min, zip(*corners)))
+        max_corner = mathutils.Vector(map(max, zip(*corners)))
+        return [[*min_corner], [*max_corner]]
+
+    @staticmethod
+    def _vec_list(vec):
+        """Serialize a vector/euler/quaternion to a plain list of floats rounded to 4 decimals"""
+        return [round(float(v), 4) for v in vec]
+
+    @staticmethod
+    def _cap_string(text, max_len=8000):
+        """Cap a long string at max_len chars with a truncation suffix"""
+        if text is None:
+            return None
+        if len(text) > max_len:
+            return text[:max_len] + "... [truncated]"
+        return text
+
+    @staticmethod
+    def _filter_traceback(tb):
+        """Strip traceback frames that don't come from executed MCP code ("<mcp>")"""
+        try:
+            filtered = []
+            skipping = False
+            for line in tb.splitlines():
+                if line.startswith('  File "'):
+                    skipping = '"<mcp>"' not in line
+                    if not skipping:
+                        filtered.append(line)
+                elif line.startswith('    ') and skipping:
+                    continue
+                else:
+                    skipping = False
+                    filtered.append(line)
+            return "\n".join(filtered)
+        except Exception:
+            return tb
+
+    @staticmethod
+    def _snapshot_scene_state():
+        """Snapshot object transforms, material and collection names for scene diffing"""
+        objects = {}
+        for obj in bpy.data.objects:
+            try:
+                mat = obj.matrix_world
+                objects[obj.name] = hash(tuple(round(v, 6) for row in mat for v in row))
+            except Exception:
+                objects[obj.name] = None
+        return {
+            "objects": objects,
+            "materials": set(m.name for m in bpy.data.materials),
+            "collections": set(c.name for c in bpy.data.collections),
+        }
+
+    @staticmethod
+    def _compute_scene_diff(before):
+        """Compute what changed in the scene since a _snapshot_scene_state snapshot"""
+        after = BlenderMCPServer._snapshot_scene_state()
+        added = sorted(set(after["objects"]) - set(before["objects"]))
+        removed = sorted(set(before["objects"]) - set(after["objects"]))
+        modified = sorted(
+            name for name, h in before["objects"].items()
+            if name in after["objects"] and after["objects"][name] != h
+        )
+        return {
+            "objects_added": added[:50],
+            "objects_removed": removed[:50],
+            "objects_modified": modified[:50],
+            "materials_added": sorted(after["materials"] - before["materials"])[:50],
+            "collections_added": sorted(after["collections"] - before["collections"])[:50],
+        }
+
+    def get_scene_graph(self, filter_type=None, name_contains=None, collection=None,
+                        offset=0, limit=50, include=None):
+        """Get a filterable, paginated view of the scene: objects, collections and scene state"""
+        scene = bpy.context.scene
+        include = set(include) if include else set()
+
+        try:
+            mode = bpy.context.mode
+        except Exception:
+            mode = "OBJECT"
+        try:
+            active_object = bpy.context.active_object.name if bpy.context.active_object else None
+            selected_objects = [o.name for o in bpy.context.selected_objects][:20]
+        except Exception:
+            active_object = None
+            selected_objects = []
+
+        scene_block = {
+            "name": scene.name,
+            "frame_start": scene.frame_start,
+            "frame_end": scene.frame_end,
+            "fps": scene.render.fps,
+            "frame_current": scene.frame_current,
+            "mode": mode,
+            "active_object": active_object,
+            "selected_objects": selected_objects,
+            "engine": scene.render.engine,
+        }
+
+        # Flat collection list with parents (top-level collections have parent None)
+        parent_map = {}
+        for col in bpy.data.collections:
+            for child in col.children:
+                parent_map[child.name] = col.name
+        collections_block = [
+            {
+                "name": col.name,
+                "parent": parent_map.get(col.name),
+                "objects_count": len(col.objects),
+            }
+            for col in bpy.data.collections
+        ][:100]
+        collections_total = len(bpy.data.collections)
+
+        # Filter objects
+        objs = list(scene.objects)
+        if filter_type:
+            wanted = str(filter_type).upper()
+            objs = [o for o in objs if o.type == wanted]
+        if name_contains:
+            needle = str(name_contains).lower()
+            objs = [o for o in objs if needle in o.name.lower()]
+        if collection:
+            col = bpy.data.collections.get(collection)
+            if col is None:
+                raise ValueError(f"Collection '{collection}' not found. Use get_scene_graph to list collections.")
+            col_names = set(o.name for o in col.all_objects)
+            objs = [o for o in objs if o.name in col_names]
+
+        total_count = len(objs)
+        offset = max(0, int(offset))
+        limit = max(1, min(int(limit), 100))
+        objs = objs[offset:offset + limit]
+
+        objects_block = []
+        for obj in objs:
+            try:
+                visible = obj.visible_get()
+            except Exception:
+                visible = True
+            entry = {
+                "name": obj.name,
+                "type": obj.type,
+                "parent": obj.parent.name if obj.parent else None,
+                "collections": [c.name for c in obj.users_collection],
+                "location": self._vec_list(obj.location),
+                "rotation_euler": self._vec_list(obj.rotation_euler),
+                "scale": self._vec_list(obj.scale),
+                "dimensions": self._vec_list(obj.dimensions),
+                "visible": visible,
+                "material_slots": [s.material.name for s in obj.material_slots if s.material],
+                "has_animation": bool(obj.animation_data and obj.animation_data.action),
+            }
+            if "modifiers" in include:
+                entry["modifiers"] = [{"name": m.name, "type": m.type} for m in obj.modifiers]
+            if "bounds" in include and obj.type == 'MESH':
+                try:
+                    bbox = self._get_aabb(obj)
+                    entry["world_bounding_box"] = [self._vec_list(bbox[0]), self._vec_list(bbox[1])]
+                except Exception:
+                    pass
+            if "mesh_stats" in include and obj.type == 'MESH' and obj.data:
+                entry["mesh_stats"] = {
+                    "vertices": len(obj.data.vertices),
+                    "polygons": len(obj.data.polygons),
+                }
+            objects_block.append(entry)
+
+        return {
+            "scene": scene_block,
+            "collections": collections_block,
+            "collections_total": collections_total,
+            "total_count": total_count,
+            "returned_count": len(objects_block),
+            "offset": offset,
+            "objects": objects_block,
+        }
 
     def get_object_info(self, name):
         """Get detailed information about a specific object"""
         obj = bpy.data.objects.get(name)
         if not obj:
-            raise ValueError(f"Object not found: {name}")
+            raise ValueError(f"Object '{name}' not found. Use get_scene_graph to list objects.")
 
         # Basic object info
         obj_info = {
@@ -339,6 +815,15 @@ class BlenderMCPServer:
             "scale": [obj.scale.x, obj.scale.y, obj.scale.z],
             "visible": obj.visible_get(),
             "materials": [],
+            "dimensions": self._vec_list(obj.dimensions),
+            "parent": obj.parent.name if obj.parent else None,
+            "collections": [c.name for c in obj.users_collection],
+            "modifiers": [
+                {"name": m.name, "type": m.type, "show_viewport": m.show_viewport}
+                for m in obj.modifiers
+            ],
+            "constraints": [{"name": c.name, "type": c.type} for c in obj.constraints],
+            "vertex_groups": [vg.name for vg in obj.vertex_groups],
         }
 
         if obj.type == "MESH":
@@ -359,6 +844,57 @@ class BlenderMCPServer:
                 "polygons": len(mesh.polygons),
             }
 
+        # UV layers (mesh data only)
+        uv_layers = getattr(obj.data, "uv_layers", None) if obj.data else None
+        obj_info["uv_layers"] = [uv.name for uv in uv_layers] if uv_layers else []
+
+        # Shape keys (mesh/curve/lattice data)
+        shape_keys = getattr(obj.data, "shape_keys", None) if obj.data else None
+        if shape_keys:
+            obj_info["shape_keys"] = [
+                {"name": kb.name, "value": round(float(kb.value), 4)}
+                for kb in shape_keys.key_blocks
+            ]
+        else:
+            obj_info["shape_keys"] = None
+
+        # Animation data
+        anim = obj.animation_data
+        if anim:
+            fcurves = []
+            action = anim.action
+            if action:
+                for fc in self._action_fcurves(action)[:50]:
+                    try:
+                        frame_range = self._vec_list(fc.range())
+                    except Exception:
+                        frame_range = None
+                    fcurves.append({
+                        "data_path": fc.data_path,
+                        "array_index": fc.array_index,
+                        "keyframe_count": len(fc.keyframe_points),
+                        "frame_range": frame_range,
+                    })
+            obj_info["animation"] = {
+                "action": action.name if action else None,
+                "fcurves": fcurves,
+                "nla_tracks": [t.name for t in anim.nla_tracks],
+            }
+        else:
+            obj_info["animation"] = None
+
+        # Armature bones
+        if obj.type == 'ARMATURE' and obj.data:
+            obj_info["bones"] = [
+                {
+                    "name": bone.name,
+                    "parent": bone.parent.name if bone.parent else None,
+                    "head": self._vec_list(bone.head_local),
+                    "tail": self._vec_list(bone.tail_local),
+                }
+                for bone in obj.data.bones[:100]
+            ]
+
         return obj_info
 
     def get_viewport_screenshot(self, max_size=800, filepath=None, format="png"):
@@ -367,14 +903,22 @@ class BlenderMCPServer:
 
         Parameters:
         - max_size: Maximum size in pixels for the largest dimension of the image
-        - filepath: Path where to save the screenshot file
+        - filepath: Optional path where to save the screenshot file (a temp file is used if omitted)
         - format: Image format (png, jpg, etc.)
 
-        Returns success/error status
+        Returns image_data (base64), width, height and format (plus filepath when one was given)
         """
         try:
-            if not filepath:
-                return {"error": "No filepath provided"}
+            fmt = str(format).lower().lstrip(".")
+            if fmt == "jpg":
+                fmt = "jpeg"
+            auto_generated = not filepath
+            if auto_generated:
+                ext = "jpg" if fmt == "jpeg" else fmt
+                filepath = os.path.join(
+                    tempfile.gettempdir(),
+                    f"blendermcp_screenshot_{os.getpid()}_{int(time.time() * 1000)}.{ext}"
+                )
 
             # Find the active 3D viewport
             area = None
@@ -401,49 +945,1729 @@ class BlenderMCPServer:
                 img.scale(new_width, new_height)
 
                 # Set format and save
-                img.file_format = format.upper()
+                img.file_format = "JPEG" if fmt == "jpeg" else fmt.upper()
                 img.save()
                 width, height = new_width, new_height
 
             # Cleanup Blender image data
             bpy.data.images.remove(img)
 
+            # Always return the image bytes as base64 so remote MCP servers
+            # (which may not share a filesystem with Blender) still get the image
+            with open(filepath, "rb") as f:
+                image_data = base64.b64encode(f.read()).decode("utf-8")
+
+            if auto_generated:
+                try:
+                    os.remove(filepath)
+                except Exception:
+                    pass
+                filepath = None
+
             return {
                 "success": True,
                 "width": width,
                 "height": height,
-                "filepath": filepath
+                "filepath": filepath,
+                "image_data": image_data,
+                "format": fmt,
             }
 
         except Exception as e:
             return {"error": str(e)}
 
-    def execute_code(self, code):
-        """Execute arbitrary Blender Python code"""
+    def execute_code(self, code, rollback_on_error=False, reset_namespace=False):
+        """Execute arbitrary Blender Python code with REPL semantics.
+
+        Runs in a persistent namespace (pre-loaded with bpy, bmesh, mathutils,
+        math, json, random, Vector, Matrix, Euler, Quaternion). If the last
+        top-level statement is an expression, its repr() is returned as
+        result_repr. On error this returns (not raises) the result dict so the
+        caller gets the traceback and scene diff; rollback_on_error undoes the
+        checkpoint pushed before the command ran.
+        """
         # This is powerful but potentially dangerous - use with caution
+        global _EXEC_NAMESPACE
+        if reset_namespace or _EXEC_NAMESPACE is None:
+            _EXEC_NAMESPACE = _init_exec_namespace()
+        namespace = _EXEC_NAMESPACE
+
+        snapshot = self._snapshot_scene_state()
+        result = {
+            "executed": False,
+            "stdout": "",
+            "result_repr": None,
+            "error": None,
+            "rolled_back": False,
+            "scene_diff": {},
+        }
+
+        capture_buffer = io.StringIO()
         try:
-            # Create a local namespace for execution
-            namespace = {"bpy": bpy}
+            tree = ast.parse(code, filename="<mcp>")
+            last_expr = None
+            if tree.body and isinstance(tree.body[-1], ast.Expr):
+                last_expr = ast.Expression(tree.body[-1].value)
+                tree.body = tree.body[:-1]
+            exec_code = compile(tree, "<mcp>", "exec")
 
-            # Capture stdout during execution, and return it as result
-            capture_buffer = io.StringIO()
+            # Capture stdout during execution
             with redirect_stdout(capture_buffer):
-                exec(code, namespace)
-
-            captured_output = capture_buffer.getvalue()
-            return {"executed": True, "result": captured_output}
+                exec(exec_code, namespace)
+                if last_expr is not None:
+                    eval_code = compile(last_expr, "<mcp>", "eval")
+                    value = eval(eval_code, namespace)
+                    result["result_repr"] = self._cap_string(repr(value))
+            result["executed"] = True
         except Exception as e:
-            raise Exception(f"Code execution error: {str(e)}")
+            tb = self._filter_traceback(traceback.format_exc())
+            result["error"] = {
+                "type": type(e).__name__,
+                "message": str(e),
+                "traceback": self._cap_string(tb),
+            }
+            if rollback_on_error:
+                # The undo checkpoint pushed before this command (see
+                # MUTATING_COMMANDS in execute_wrapper) captured the pre-command
+                # state. ed.undo() restores the step BEFORE the active one, so
+                # push a step for the current (failed) state first - the single
+                # undo then lands exactly on the pre-command snapshot instead of
+                # also reverting the previous command.
+                try:
+                    try:
+                        bpy.ops.ed.undo_push(message="MCP: failed state")
+                    except Exception:
+                        pass
+                    bpy.ops.ed.undo()
+                    result["rolled_back"] = True
+                except Exception as undo_err:
+                    print(f"Rollback failed: {str(undo_err)}")
 
+        result["stdout"] = self._cap_string(capture_buffer.getvalue())
+        result["scene_diff"] = self._compute_scene_diff(snapshot)
+        return result
 
+    # ------------------------------------------------------------------
+    # Modelling helpers & handlers (C1)
+    # ------------------------------------------------------------------
+
+    def _transform_status(self, obj):
+        """Standard transform report returned by set_transform/place_object"""
+        try:
+            bpy.context.view_layer.update()
+        except Exception:
+            pass
+        status = {
+            "name": obj.name,
+            "location": self._vec_list(obj.location),
+            "rotation_euler": self._vec_list(obj.rotation_euler),
+            "scale": self._vec_list(obj.scale),
+            "dimensions": self._vec_list(obj.dimensions),
+        }
+        if obj.type == 'MESH':
+            try:
+                bbox = self._get_aabb(obj)
+                status["world_bounding_box"] = [self._vec_list(bbox[0]), self._vec_list(bbox[1])]
+            except Exception:
+                pass
+        return status
+
+    @staticmethod
+    def _ensure_object_mode():
+        """Switch to OBJECT mode if needed (some operators require it)"""
+        try:
+            if bpy.context.mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+        except Exception:
+            pass
+
+    @staticmethod
+    def _get_object_or_raise(name):
+        obj = bpy.data.objects.get(name)
+        if not obj:
+            raise ValueError(f"Object '{name}' not found. Use get_scene_graph to list objects.")
+        return obj
+
+    @staticmethod
+    def _check_vec3(value, label):
+        if not isinstance(value, (list, tuple)) or len(value) != 3:
+            raise ValueError(f"{label} must be a list of 3 floats.")
+        return [float(v) for v in value]
+
+    def set_transform(self, name, location=None, rotation_euler=None, scale=None, relative=False):
+        """Set or offset an object's location/rotation (radians)/scale"""
+        obj = self._get_object_or_raise(name)
+
+        if location is not None:
+            loc = self._check_vec3(location, "location")
+            if relative:
+                obj.location = [obj.location[i] + loc[i] for i in range(3)]
+            else:
+                obj.location = loc
+        if rotation_euler is not None:
+            rot = self._check_vec3(rotation_euler, "rotation_euler")
+            if relative:
+                obj.rotation_euler = [obj.rotation_euler[i] + rot[i] for i in range(3)]
+            else:
+                obj.rotation_euler = rot
+        if scale is not None:
+            scl = self._check_vec3(scale, "scale")
+            if relative:
+                obj.scale = [obj.scale[i] * scl[i] for i in range(3)]
+            else:
+                obj.scale = scl
+
+        return self._transform_status(obj)
+
+    @staticmethod
+    def _translate_world(obj, delta):
+        """Translate an object by a world-space delta.
+
+        obj.location is expressed in parent space, so adding a world-space
+        delta to it is wrong for children of rotated/scaled parents; move the
+        world matrix translation instead (Blender back-computes location).
+        """
+        mw = obj.matrix_world.copy()
+        mw.translation = mw.translation + mathutils.Vector(delta)
+        obj.matrix_world = mw
+        try:
+            bpy.context.view_layer.update()
+        except Exception:
+            pass
+
+    def place_object(self, name, mode="ground", target=None, offset=None, margin=0.0):
+        """Place an object using AABB math: on the ground, on another object, or by offset"""
+        obj = self._get_object_or_raise(name)
+        mode = str(mode).lower()
+        if mode not in ("ground", "on_object", "offset"):
+            raise ValueError(f"Unknown mode '{mode}'. Use 'ground', 'on_object' or 'offset'.")
+        if offset is not None:
+            offset = self._check_vec3(offset, "offset")
+        margin = float(margin)
+
+        try:
+            bpy.context.view_layer.update()
+        except Exception:
+            pass
+
+        if mode == "offset":
+            if offset is None:
+                raise ValueError("mode 'offset' requires an offset [x, y, z].")
+            self._translate_world(obj, offset)
+            return self._transform_status(obj)
+
+        aabb_min, aabb_max = self._get_world_aabb(obj)
+
+        if mode == "ground":
+            delta = [0.0, 0.0, margin - aabb_min[2]]
+        else:  # on_object
+            if not target:
+                raise ValueError("mode 'on_object' requires a target object name.")
+            tobj = self._get_object_or_raise(target)
+            if tobj is obj:
+                raise ValueError("target must be a different object than name.")
+            t_min, t_max = self._get_world_aabb(tobj)
+            delta = [
+                (t_min[0] + t_max[0]) / 2.0 - (aabb_min[0] + aabb_max[0]) / 2.0,
+                (t_min[1] + t_max[1]) / 2.0 - (aabb_min[1] + aabb_max[1]) / 2.0,
+                (t_max[2] + margin) - aabb_min[2],
+            ]
+        if offset is not None:
+            delta = [delta[i] + offset[i] for i in range(3)]
+        self._translate_world(obj, delta)
+        return self._transform_status(obj)
+
+    @staticmethod
+    def _modifier_params_summary(mod, max_props=8):
+        """Up to max_props interesting non-default rna props of a modifier, as primitives"""
+        skip = {
+            "name", "type", "show_viewport", "show_render", "show_in_editmode",
+            "show_on_cage", "show_expanded", "is_active", "use_pin_to_last",
+            "is_override_data", "use_apply_on_spline", "execution_time",
+            "persistent_uid", "rna_type",
+        }
+        out = {}
+        try:
+            for prop in mod.bl_rna.properties:
+                if len(out) >= max_props:
+                    break
+                pid = prop.identifier
+                if pid in skip or prop.is_readonly:
+                    continue
+                try:
+                    if prop.type == 'POINTER':
+                        val = getattr(mod, pid, None)
+                        if isinstance(val, bpy.types.ID):
+                            out[pid] = val.name
+                        continue
+                    if prop.type not in ('BOOLEAN', 'INT', 'FLOAT', 'STRING', 'ENUM'):
+                        continue
+                    if prop.type == 'ENUM' and getattr(prop, "is_enum_flag", False):
+                        continue
+                    if getattr(prop, "is_array", False) and getattr(prop, "array_length", 0) > 0:
+                        val = [round(float(v), 4) for v in getattr(mod, pid)]
+                        try:
+                            default = [round(float(v), 4) for v in prop.default_array]
+                            if val == default:
+                                continue
+                        except Exception:
+                            pass
+                        out[pid] = val
+                        continue
+                    val = getattr(mod, pid)
+                    default = getattr(prop, "default", None)
+                    if prop.type == 'FLOAT':
+                        if default is not None and abs(float(val) - float(default)) < 1e-9:
+                            continue
+                        out[pid] = round(float(val), 4)
+                    else:
+                        if default is not None and val == default:
+                            continue
+                        out[pid] = val
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return out
+
+    def _modifier_list(self, obj):
+        """Serialize an object's modifier stack"""
+        return [
+            {
+                "name": m.name,
+                "type": m.type,
+                "show_viewport": m.show_viewport,
+                "params": self._modifier_params_summary(m),
+            }
+            for m in obj.modifiers
+        ][:100]
+
+    @staticmethod
+    def _set_modifier_params(mod, params):
+        """setattr params onto a modifier; returns {key: reason} for ignored/failed keys"""
+        ignored = {}
+        if not params:
+            return ignored
+        for key, value in params.items():
+            if not hasattr(mod, key):
+                ignored[key] = "unknown parameter"
+                continue
+            try:
+                prop = mod.bl_rna.properties.get(key)
+                if prop is not None and prop.type == 'POINTER' and isinstance(value, str):
+                    # Resolve datablock references by name (e.g. Boolean/Array targets)
+                    resolved = bpy.data.objects.get(value)
+                    if resolved is None:
+                        resolved = bpy.data.collections.get(value)
+                    if resolved is None:
+                        ignored[key] = f"could not resolve '{value}' to an object or collection"
+                        continue
+                    setattr(mod, key, resolved)
+                else:
+                    setattr(mod, key, value)
+            except Exception as e:
+                ignored[key] = str(e)
+        return ignored
+
+    def _find_modifier(self, obj, modifier_name=None, modifier_type=None):
+        """Resolve a modifier by name, else by type, else the only one present"""
+        if not obj.modifiers:
+            raise ValueError(f"Object '{obj.name}' has no modifiers.")
+        if modifier_name:
+            mod = obj.modifiers.get(modifier_name)
+            if not mod:
+                raise ValueError(
+                    f"Modifier '{modifier_name}' not found on '{obj.name}'. "
+                    f"Modifiers: {[m.name for m in obj.modifiers]}"
+                )
+            return mod
+        if modifier_type:
+            wanted = str(modifier_type).upper()
+            for m in obj.modifiers:
+                if m.type == wanted:
+                    return m
+            raise ValueError(f"No modifier of type '{wanted}' on '{obj.name}'.")
+        if len(obj.modifiers) == 1:
+            return obj.modifiers[0]
+        raise ValueError(
+            f"Specify modifier_name (or modifier_type). "
+            f"Modifiers on '{obj.name}': {[m.name for m in obj.modifiers]}"
+        )
+
+    def manage_modifiers(self, name, action, modifier_type=None, modifier_name=None, params=None, index=None):
+        """List/add/configure/apply/remove/reorder modifiers on an object"""
+        obj = self._get_object_or_raise(name)
+        action = str(action).lower()
+        valid_actions = ("list", "add", "set_params", "apply", "remove", "move")
+        if action not in valid_actions:
+            raise ValueError(f"Unknown action '{action}'. Use one of: {', '.join(valid_actions)}.")
+
+        result = {"object": obj.name, "action": action}
+
+        if action == "list":
+            result["modifiers"] = self._modifier_list(obj)
+            return result
+
+        if action == "add":
+            if not modifier_type:
+                raise ValueError("action 'add' requires modifier_type (e.g. 'SUBSURF', 'BEVEL', 'ARRAY').")
+            mod_type = str(modifier_type).upper()
+            try:
+                mod = obj.modifiers.new(name=modifier_name or mod_type.title(), type=mod_type)
+            except Exception as e:
+                raise ValueError(f"Could not add modifier of type '{mod_type}': {str(e)}")
+            if mod is None:
+                raise ValueError(
+                    f"Modifier type '{mod_type}' is not valid for object '{obj.name}' (type {obj.type})."
+                )
+            ignored = self._set_modifier_params(mod, params)
+            result["modifier"] = mod.name
+            if ignored:
+                result["ignored_params"] = ignored
+            result["modifiers"] = self._modifier_list(obj)
+            return result
+
+        mod = self._find_modifier(obj, modifier_name, modifier_type)
+
+        if action == "set_params":
+            if not params:
+                raise ValueError("action 'set_params' requires a params dict.")
+            ignored = self._set_modifier_params(mod, params)
+            result["modifier"] = mod.name
+            if ignored:
+                result["ignored_params"] = ignored
+        elif action == "apply":
+            mod_name = mod.name
+            self._ensure_object_mode()
+            try:
+                with bpy.context.temp_override(object=obj, active_object=obj, selected_objects=[obj]):
+                    bpy.ops.object.modifier_apply(modifier=mod_name)
+            except Exception as e:
+                raise Exception(f"Failed to apply modifier '{mod_name}' on '{obj.name}': {str(e)}")
+            result["applied"] = mod_name
+        elif action == "remove":
+            mod_name = mod.name
+            obj.modifiers.remove(mod)
+            result["removed"] = mod_name
+        elif action == "move":
+            if index is None:
+                raise ValueError("action 'move' requires an index (0 = top of the stack).")
+            idx = max(0, min(int(index), len(obj.modifiers) - 1))
+            try:
+                with bpy.context.temp_override(object=obj, active_object=obj, selected_objects=[obj]):
+                    bpy.ops.object.modifier_move_to_index(modifier=mod.name, index=idx)
+            except Exception as e:
+                raise Exception(f"Failed to move modifier '{mod.name}': {str(e)}")
+            result["modifier"] = mod.name
+            result["index"] = idx
+
+        result["modifiers"] = self._modifier_list(obj)
+        return result
+
+    def boolean_op(self, object_a, object_b, operation="DIFFERENCE", apply=True, delete_operand=True, solver="EXACT"):
+        """Boolean modifier on object_a targeting object_b, optionally applied + operand deleted"""
+        obj_a = self._get_object_or_raise(object_a)
+        obj_b = self._get_object_or_raise(object_b)
+        if obj_a is obj_b:
+            raise ValueError("object_a and object_b must be different objects.")
+        if obj_a.type != 'MESH' or obj_b.type != 'MESH':
+            raise ValueError("Boolean operations require two MESH objects.")
+        operation = str(operation).upper()
+        if operation not in ("DIFFERENCE", "UNION", "INTERSECT"):
+            raise ValueError(f"Invalid operation '{operation}'. Use DIFFERENCE, UNION or INTERSECT.")
+
+        mesh_stats_before = {
+            "vertices": len(obj_a.data.vertices),
+            "polygons": len(obj_a.data.polygons),
+        }
+
+        mod = obj_a.modifiers.new(name="MCP_Boolean", type='BOOLEAN')
+        if mod is None:
+            raise Exception(f"Could not add a Boolean modifier to '{obj_a.name}'.")
+        mod.object = obj_b
+        mod.operation = operation
+        if solver and hasattr(mod, "solver"):
+            try:
+                mod.solver = str(solver).upper()
+            except Exception:
+                obj_a.modifiers.remove(mod)
+                raise ValueError(f"Invalid solver '{solver}'. Use 'EXACT' or 'FAST'.")
+
+        applied = False
+        operand_deleted = False
+        if apply:
+            mod_name = mod.name
+            self._ensure_object_mode()
+            try:
+                with bpy.context.temp_override(object=obj_a, active_object=obj_a, selected_objects=[obj_a]):
+                    bpy.ops.object.modifier_apply(modifier=mod_name)
+                applied = True
+            except Exception as e:
+                with suppress(Exception):
+                    obj_a.modifiers.remove(mod)
+                raise Exception(f"Failed to apply Boolean modifier: {str(e)}")
+            if delete_operand:
+                try:
+                    bpy.data.objects.remove(obj_b, do_unlink=True)
+                    operand_deleted = True
+                except Exception as e:
+                    print(f"Could not delete operand: {str(e)}")
+
+        try:
+            bpy.context.view_layer.update()
+        except Exception:
+            pass
+
+        if applied:
+            mesh_stats_after = {
+                "vertices": len(obj_a.data.vertices),
+                "polygons": len(obj_a.data.polygons),
+            }
+        else:
+            # Modifier left live: report the evaluated (with-modifier) mesh stats
+            try:
+                deps = bpy.context.evaluated_depsgraph_get()
+                eval_obj = obj_a.evaluated_get(deps)
+                mesh_stats_after = {
+                    "vertices": len(eval_obj.data.vertices),
+                    "polygons": len(eval_obj.data.polygons),
+                }
+            except Exception:
+                mesh_stats_after = mesh_stats_before
+
+        bbox = self._get_aabb(obj_a)
+        result = {
+            "object": obj_a.name,
+            "operation": operation,
+            "applied": applied,
+            "mesh_stats_before": mesh_stats_before,
+            "mesh_stats_after": mesh_stats_after,
+            "world_bounding_box": [self._vec_list(bbox[0]), self._vec_list(bbox[1])],
+        }
+        if not applied:
+            result["modifier"] = mod.name
+            if delete_operand:
+                result["note"] = "operand kept: it is still referenced by the live Boolean modifier"
+        elif delete_operand:
+            result["operand_deleted"] = operand_deleted
+        return result
+
+    def organize_scene(self, action, name=None, parent=None, objects=None, collection=None,
+                       child=None, keep_transform=True, old=None, new=None):
+        """Scene organization: collections, parenting, renaming and deletion"""
+        action = str(action).lower()
+        scene = bpy.context.scene
+
+        if action == "create_collection":
+            if not name:
+                raise ValueError("create_collection requires a name.")
+            parent_col = None
+            if parent:
+                parent_col = bpy.data.collections.get(parent)
+                if parent_col is None:
+                    raise ValueError(
+                        f"Parent collection '{parent}' not found. Use get_scene_graph to list collections."
+                    )
+            new_col = bpy.data.collections.new(name)
+            (parent_col or scene.collection).children.link(new_col)
+            return {
+                "action": action,
+                "collection": new_col.name,
+                "parent": parent_col.name if parent_col else None,
+                "ok": True,
+            }
+
+        if action == "move_to_collection":
+            if not objects or not collection:
+                raise ValueError("move_to_collection requires objects (list of names) and collection.")
+            if isinstance(objects, str):
+                objects = [objects]
+            col = bpy.data.collections.get(collection)
+            if col is None:
+                if collection == scene.collection.name:
+                    col = scene.collection
+                else:
+                    raise ValueError(
+                        f"Collection '{collection}' not found. Use organize_scene create_collection first."
+                    )
+            moved, not_found = [], []
+            for obj_name in objects:
+                obj = bpy.data.objects.get(obj_name)
+                if obj is None:
+                    not_found.append(obj_name)
+                    continue
+                for c in list(obj.users_collection):
+                    with suppress(Exception):
+                        c.objects.unlink(obj)
+                with suppress(Exception):
+                    col.objects.link(obj)
+                moved.append(obj.name)
+            return {"action": action, "collection": col.name, "moved": moved,
+                    "not_found": not_found, "ok": True}
+
+        if action == "set_parent":
+            if not child or not parent:
+                raise ValueError("set_parent requires child and parent object names.")
+            child_obj = self._get_object_or_raise(child)
+            parent_obj = self._get_object_or_raise(parent)
+            if child_obj is parent_obj:
+                raise ValueError("child and parent must be different objects.")
+            try:
+                bpy.context.view_layer.update()
+            except Exception:
+                pass
+            child_obj.parent = parent_obj
+            if keep_transform:
+                child_obj.matrix_parent_inverse = parent_obj.matrix_world.inverted()
+            else:
+                child_obj.matrix_parent_inverse.identity()
+            return {"action": action, "child": child_obj.name, "parent": parent_obj.name,
+                    "keep_transform": bool(keep_transform), "ok": True}
+
+        if action == "clear_parent":
+            if not child:
+                raise ValueError("clear_parent requires a child object name.")
+            child_obj = self._get_object_or_raise(child)
+            if child_obj.parent is not None:
+                try:
+                    bpy.context.view_layer.update()
+                except Exception:
+                    pass
+                if keep_transform:
+                    world_matrix = child_obj.matrix_world.copy()
+                    child_obj.parent = None
+                    child_obj.matrix_world = world_matrix
+                else:
+                    child_obj.parent = None
+            return {"action": action, "child": child_obj.name,
+                    "keep_transform": bool(keep_transform), "ok": True}
+
+        if action == "rename":
+            if not old or not new:
+                raise ValueError("rename requires old and new names.")
+            obj = bpy.data.objects.get(old)
+            if not obj:
+                raise ValueError(f"Object '{old}' not found. Use get_scene_graph to list objects.")
+            obj.name = new
+            return {"action": action, "old": old, "name": obj.name, "ok": True}
+
+        if action == "delete":
+            if not objects:
+                raise ValueError("delete requires objects (list of names).")
+            if isinstance(objects, str):
+                objects = [objects]
+            deleted, not_found = [], []
+            for obj_name in objects:
+                obj = bpy.data.objects.get(obj_name)
+                if obj is None:
+                    not_found.append(obj_name)
+                else:
+                    bpy.data.objects.remove(obj, do_unlink=True)
+                    deleted.append(obj_name)
+            return {"action": action, "deleted": deleted, "not_found": not_found, "ok": True}
+
+        raise ValueError(
+            f"Unknown action '{action}'. Use create_collection, move_to_collection, "
+            f"set_parent, clear_parent, rename or delete."
+        )
+
+    # ------------------------------------------------------------------
+    # Animation helpers & handlers (C2)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _timeline_status():
+        """Current timeline state (shared by manage_timeline and get_animation_info)"""
+        scene = bpy.context.scene
+        try:
+            fps = scene.render.fps / scene.render.fps_base
+        except Exception:
+            fps = float(scene.render.fps)
+        frame_count = scene.frame_end - scene.frame_start + 1
+        return {
+            "frame_start": scene.frame_start,
+            "frame_end": scene.frame_end,
+            "fps": round(fps, 4),
+            "frame_current": scene.frame_current,
+            "duration_seconds": round(frame_count / fps, 4) if fps else None,
+        }
+
+    @staticmethod
+    def _action_fcurves(action):
+        """Fcurves of an action; handles slotted/layered actions (Blender 4.4+/5.x)"""
+        if action is None:
+            return []
+        fcurves = []
+        try:
+            fcurves = list(action.fcurves)
+            if fcurves:
+                return fcurves
+        except Exception:
+            fcurves = []
+        try:
+            for layer in action.layers:
+                for strip in layer.strips:
+                    for bag in strip.channelbags:
+                        fcurves.extend(bag.fcurves)
+        except Exception:
+            pass
+        return fcurves
+
+    @staticmethod
+    def _remove_fcurve(action, fc):
+        """Remove an fcurve from an action, handling slotted actions"""
+        try:
+            action.fcurves.remove(fc)
+            return True
+        except Exception:
+            pass
+        try:
+            for layer in action.layers:
+                for strip in layer.strips:
+                    for bag in strip.channelbags:
+                        try:
+                            bag.fcurves.remove(fc)
+                            return True
+                        except Exception:
+                            continue
+        except Exception:
+            pass
+        return False
+
+    def _fcurve_summaries(self, obj, data_path=None):
+        """Summaries (data_path/index/count/range) of an object's action fcurves"""
+        summaries = []
+        anim = obj.animation_data
+        action = anim.action if anim else None
+        for fc in self._action_fcurves(action):
+            if data_path and fc.data_path != data_path:
+                continue
+            try:
+                frame_range = self._vec_list(fc.range())
+            except Exception:
+                frame_range = None
+            summaries.append({
+                "data_path": fc.data_path,
+                "array_index": fc.array_index,
+                "keyframe_count": len(fc.keyframe_points),
+                "frame_range": frame_range,
+            })
+        return summaries[:100]
+
+    def _count_keyframe_points(self, obj, data_path=None):
+        """Total keyframe points across an object's action fcurves (optionally filtered)"""
+        anim = obj.animation_data
+        action = anim.action if anim else None
+        total = 0
+        for fc in self._action_fcurves(action):
+            if data_path and fc.data_path != data_path:
+                continue
+            total += len(fc.keyframe_points)
+        return total
+
+    @staticmethod
+    def _resolve_keyframe_target(obj, data_path):
+        """Resolve the property owner + attribute for a data path (supports pose bones etc.)"""
+        if "." in data_path:
+            owner_path, _, attr = data_path.rpartition(".")
+            try:
+                owner = obj.path_resolve(owner_path)
+            except Exception:
+                raise ValueError(
+                    f"Cannot resolve data path '{data_path}' on object '{obj.name}'. "
+                    f"Example paths: 'location', 'pose.bones[\"Bone\"].rotation_euler'."
+                )
+        else:
+            owner, attr = obj, data_path
+        if not hasattr(owner, attr):
+            raise ValueError(f"Property '{attr}' not found for data path '{data_path}' on '{obj.name}'.")
+        return owner, attr
+
+    def manage_timeline(self, action="get", frame_start=None, frame_end=None, fps=None, frame_current=None):
+        """Get or set the scene timeline (frame range, fps, current frame)"""
+        action = str(action).lower()
+        if action not in ("get", "set"):
+            raise ValueError(f"Unknown action '{action}'. Use 'get' or 'set'.")
+        scene = bpy.context.scene
+        if frame_start is not None:
+            scene.frame_start = int(frame_start)
+        if frame_end is not None:
+            scene.frame_end = int(frame_end)
+        if fps is not None:
+            scene.render.fps = int(round(float(fps)))
+            scene.render.fps_base = 1.0
+        if frame_current is not None:
+            scene.frame_set(int(frame_current))
+        return self._timeline_status()
+
+    def set_keyframes(self, name, data_path, keys, index=-1, interpolation=None):
+        """Insert keyframes on a property. keys = [{"frame": int, "value": float|[floats]}]"""
+        obj = self._get_object_or_raise(name)
+        if not keys or not isinstance(keys, (list, tuple)):
+            raise ValueError("keys must be a non-empty list of {'frame': int, 'value': float|[floats]} dicts.")
+        index = -1 if index is None else int(index)
+        if interpolation is not None:
+            interpolation = str(interpolation).upper()
+            if interpolation not in KEYFRAME_INTERPOLATIONS:
+                raise ValueError(
+                    f"Invalid interpolation '{interpolation}'. "
+                    f"Valid: {', '.join(sorted(KEYFRAME_INTERPOLATIONS))}."
+                )
+
+        owner, attr = self._resolve_keyframe_target(obj, data_path)
+        points_before = self._count_keyframe_points(obj, data_path)
+        frames_written = []
+
+        for key in keys:
+            if not isinstance(key, dict) or "frame" not in key or "value" not in key:
+                raise ValueError("Each key must be a dict with 'frame' and 'value'.")
+            frame = int(round(float(key["frame"])))
+            value = key["value"]
+            current = getattr(owner, attr)
+            is_vector = hasattr(current, "__len__") and not isinstance(current, str)
+            insert_index = -1
+            if isinstance(value, (list, tuple)):
+                if not is_vector:
+                    raise ValueError(f"'{data_path}' is not a vector property; pass a single float value.")
+                try:
+                    setattr(owner, attr, [float(v) for v in value])
+                except Exception as e:
+                    raise ValueError(f"Cannot set '{data_path}' to {value}: {str(e)}")
+            elif is_vector:
+                if index < 0:
+                    raise ValueError(
+                        f"'{data_path}' is a vector property: pass a list value, "
+                        f"or a float with index (0-{len(current) - 1}) to key one channel."
+                    )
+                if index >= len(current):
+                    raise ValueError(f"index {index} out of range for '{data_path}' (length {len(current)}).")
+                current[index] = float(value)
+                insert_index = index
+            else:
+                try:
+                    setattr(owner, attr, value)
+                except Exception as e:
+                    raise ValueError(f"Cannot set '{data_path}' to {value!r}: {str(e)}")
+            try:
+                obj.keyframe_insert(data_path=data_path, frame=frame, index=insert_index)
+            except Exception as e:
+                raise Exception(f"keyframe_insert failed for '{data_path}' at frame {frame}: {str(e)}")
+            frames_written.append(frame)
+
+        anim = obj.animation_data
+        action = anim.action if anim else None
+        if interpolation and action:
+            frame_set = set(frames_written)
+            for fc in self._action_fcurves(action):
+                if fc.data_path != data_path:
+                    continue
+                changed = False
+                for kp in fc.keyframe_points:
+                    if int(round(kp.co[0])) in frame_set:
+                        kp.interpolation = interpolation
+                        changed = True
+                if changed:
+                    with suppress(Exception):
+                        fc.update()
+
+        return {
+            "object": obj.name,
+            "fcurves": self._fcurve_summaries(obj, data_path),
+            "keys_created": max(0, self._count_keyframe_points(obj, data_path) - points_before),
+        }
+
+    def delete_keyframes(self, name, data_path=None, frames=None):
+        """Delete keyframe points (all fcurves if data_path None; whole fcurves if frames None)"""
+        obj = self._get_object_or_raise(name)
+        anim = obj.animation_data
+        action = anim.action if anim else None
+        if not action:
+            return {"object": obj.name, "keyframes_removed": 0,
+                    "fcurves_removed": 0, "action_removed": False}
+
+        frame_set = None
+        if frames is not None:
+            if isinstance(frames, (int, float)):
+                frames = [frames]
+            frame_set = set(int(round(float(f))) for f in frames)
+
+        keyframes_removed = 0
+        fcurves_removed = 0
+        for fc in list(self._action_fcurves(action)):
+            if data_path and fc.data_path != data_path:
+                continue
+            if frame_set is None:
+                keyframes_removed += len(fc.keyframe_points)
+                if self._remove_fcurve(action, fc):
+                    fcurves_removed += 1
+                continue
+            removed_any = True
+            while removed_any:
+                removed_any = False
+                for kp in fc.keyframe_points:
+                    if int(round(kp.co[0])) in frame_set:
+                        fc.keyframe_points.remove(kp)
+                        keyframes_removed += 1
+                        removed_any = True
+                        break
+            if len(fc.keyframe_points) == 0:
+                if self._remove_fcurve(action, fc):
+                    fcurves_removed += 1
+            else:
+                with suppress(Exception):
+                    fc.update()
+
+        action_removed = False
+        if not self._action_fcurves(action):
+            with suppress(Exception):
+                anim.action = None
+                action_removed = True
+
+        return {
+            "object": obj.name,
+            "keyframes_removed": keyframes_removed,
+            "fcurves_removed": fcurves_removed,
+            "action_removed": action_removed,
+        }
+
+    def set_keyframe_interpolation(self, name, data_path=None, frames=None,
+                                   interpolation="BEZIER", easing="AUTO", make_cyclic=False):
+        """Set interpolation/easing on keyframe points; optionally add a CYCLES modifier"""
+        obj = self._get_object_or_raise(name)
+        interpolation = str(interpolation).upper()
+        if interpolation not in KEYFRAME_INTERPOLATIONS:
+            raise ValueError(
+                f"Invalid interpolation '{interpolation}'. "
+                f"Valid: {', '.join(sorted(KEYFRAME_INTERPOLATIONS))}."
+            )
+        easing = str(easing).upper()
+        if easing not in KEYFRAME_EASINGS:
+            raise ValueError(f"Invalid easing '{easing}'. Valid: {', '.join(sorted(KEYFRAME_EASINGS))}.")
+
+        anim = obj.animation_data
+        action = anim.action if anim else None
+        if not action:
+            raise ValueError(f"Object '{name}' has no animation action. Use set_keyframes first.")
+
+        frame_set = None
+        if frames is not None:
+            if isinstance(frames, (int, float)):
+                frames = [frames]
+            frame_set = set(int(round(float(f))) for f in frames)
+
+        points_modified = 0
+        fcurves_modified = 0
+        cyclic_added = 0
+        for fc in self._action_fcurves(action):
+            if data_path and fc.data_path != data_path:
+                continue
+            touched = 0
+            for kp in fc.keyframe_points:
+                if frame_set is None or int(round(kp.co[0])) in frame_set:
+                    kp.interpolation = interpolation
+                    with suppress(Exception):
+                        kp.easing = easing
+                    touched += 1
+            if make_cyclic and not any(m.type == 'CYCLES' for m in fc.modifiers):
+                try:
+                    fc.modifiers.new('CYCLES')
+                    cyclic_added += 1
+                except Exception as e:
+                    print(f"Could not add CYCLES modifier: {str(e)}")
+            if touched or make_cyclic:
+                with suppress(Exception):
+                    fc.update()
+            if touched:
+                points_modified += touched
+                fcurves_modified += 1
+
+        return {
+            "object": obj.name,
+            "interpolation": interpolation,
+            "easing": easing,
+            "points_modified": points_modified,
+            "fcurves_modified": fcurves_modified,
+            "cyclic_modifiers_added": cyclic_added,
+        }
+
+    def get_animation_info(self, name=None):
+        """Animation overview of the scene, or full animation detail for one object"""
+        if name is None:
+            scene = bpy.context.scene
+            animated = []
+            total = 0
+            for obj in scene.objects:
+                anim = obj.animation_data
+                action = anim.action if anim else None
+                if not action:
+                    continue
+                total += 1
+                if len(animated) < 100:
+                    try:
+                        frame_range = self._vec_list(action.frame_range)
+                    except Exception:
+                        frame_range = None
+                    animated.append({
+                        "name": obj.name,
+                        "action": action.name,
+                        "fcurve_count": len(self._action_fcurves(action)),
+                        "frame_range": frame_range,
+                    })
+            return {
+                "timeline": self._timeline_status(),
+                "animated_objects": animated,
+                "total_count": total,
+                "actions": sorted(a.name for a in bpy.data.actions)[:100],
+            }
+
+        obj = self._get_object_or_raise(name)
+        anim = obj.animation_data
+        action = anim.action if anim else None
+
+        all_fcurves = self._action_fcurves(action)
+        fcurves_block = []
+        for fc in all_fcurves[:100]:
+            keyframes = [
+                {
+                    "frame": round(float(kp.co[0]), 2),
+                    "value": round(float(kp.co[1]), 4),
+                    "interpolation": kp.interpolation,
+                }
+                for kp in list(fc.keyframe_points)[:50]
+            ]
+            fcurves_block.append({
+                "data_path": fc.data_path,
+                "array_index": fc.array_index,
+                "keyframe_count": len(fc.keyframe_points),
+                "keyframes": keyframes,
+            })
+
+        nla_block = []
+        if anim:
+            for track in anim.nla_tracks:
+                nla_block.append({
+                    "name": track.name,
+                    "strips": [
+                        {
+                            "name": s.name,
+                            "action": s.action.name if s.action else None,
+                            "frame_start": round(float(s.frame_start), 2),
+                            "frame_end": round(float(s.frame_end), 2),
+                        }
+                        for s in track.strips
+                    ][:100],
+                })
+
+        shape_keys = getattr(obj.data, "shape_keys", None) if obj.data else None
+        shape_block = [
+            {"name": kb.name, "value": round(float(kb.value), 4)}
+            for kb in shape_keys.key_blocks
+        ][:100] if shape_keys else []
+
+        return {
+            "object": obj.name,
+            "action": action.name if action else None,
+            "fcurves": fcurves_block,
+            "fcurve_total": len(all_fcurves),
+            "nla_tracks": nla_block[:100],
+            "shape_keys": shape_block,
+            "constraints": [{"name": c.name, "type": c.type} for c in obj.constraints][:100],
+        }
+
+    # ------------------------------------------------------------------
+    # Camera & rendering helpers & handlers (C3)
+    # ------------------------------------------------------------------
+
+    def _resolve_view_targets(self, object_names):
+        """Resolve object names to frame; default = all visible mesh objects"""
+        if object_names:
+            if isinstance(object_names, str):
+                object_names = [object_names]
+            return [self._get_object_or_raise(n) for n in object_names]
+        objs = []
+        for obj in bpy.context.scene.objects:
+            if obj.type != 'MESH':
+                continue
+            try:
+                if obj.visible_get():
+                    objs.append(obj)
+            except Exception:
+                objs.append(obj)
+        if not objs:
+            raise ValueError(
+                "No objects to frame. Pass object_names or add visible mesh objects to the scene."
+            )
+        return objs
+
+    def _resolve_render_camera(self, camera):
+        """Resolve a camera by name, else the scene camera; actionable error if neither"""
+        if camera:
+            cam_obj = self._get_object_or_raise(camera)
+            if cam_obj.type != 'CAMERA':
+                raise ValueError(f"Object '{camera}' is not a camera (type {cam_obj.type}).")
+            return cam_obj
+        cam_obj = bpy.context.scene.camera
+        if cam_obj is None:
+            raise ValueError("No scene camera. Call set_camera first to create and aim one.")
+        return cam_obj
+
+    @staticmethod
+    def _create_temp_camera(name="MCP_TempCamera"):
+        """Create a throwaway camera linked to the scene root collection"""
+        cam_data = bpy.data.cameras.new(name)
+        cam_obj = bpy.data.objects.new(name, cam_data)
+        bpy.context.scene.collection.objects.link(cam_obj)
+        return cam_obj
+
+    @staticmethod
+    def _remove_temp_camera(cam_obj):
+        """Delete a temp camera object and its orphaned camera datablock"""
+        try:
+            cam_data = cam_obj.data
+            bpy.data.objects.remove(cam_obj, do_unlink=True)
+            if cam_data and cam_data.users == 0:
+                bpy.data.cameras.remove(cam_data)
+        except Exception as e:
+            print(f"Could not remove temp camera: {str(e)}")
+
+    @staticmethod
+    def _aim_camera(cam_obj, location, target):
+        """Move a camera to location and rotate it to look at a target point"""
+        cam_obj.location = location
+        direction = mathutils.Vector(target) - mathutils.Vector(location)
+        if direction.length < 1e-9:
+            direction = mathutils.Vector((0.0, 0.0, -1.0))
+        cam_obj.rotation_mode = 'XYZ'
+        cam_obj.rotation_euler = direction.to_track_quat('-Z', 'Y').to_euler()
+
+    def _frame_camera_on_aabb(self, cam_obj, aabb, direction, margin):
+        """Place a camera along direction from the AABB center so the AABB fits in view"""
+        aabb_min = mathutils.Vector(aabb[0])
+        aabb_max = mathutils.Vector(aabb[1])
+        center = (aabb_min + aabb_max) / 2.0
+        radius = max((aabb_max - aabb_min).length / 2.0, 1e-3)
+        direction = mathutils.Vector(direction)
+        if direction.length < 1e-9:
+            direction = mathutils.Vector(CAMERA_PRESETS["isometric"])
+        direction.normalize()
+        margin = max(float(margin), 0.01)
+
+        cam_data = cam_obj.data
+        if cam_data.type == 'ORTHO':
+            distance = radius * 2.0 * margin + 1.0
+            with suppress(Exception):
+                cam_data.ortho_scale = 2.0 * radius * margin
+        else:
+            # Use the smaller field of view so the bounding sphere fits both axes
+            try:
+                fov = min(cam_data.angle_x, cam_data.angle_y)
+            except Exception:
+                fov = cam_data.angle
+            fov = max(float(fov), 0.01)
+            distance = (radius * margin) / math.tan(fov / 2.0)
+        distance = max(distance, radius + max(float(cam_data.clip_start), 0.001) + 0.01)
+        with suppress(Exception):
+            if cam_data.clip_end < distance + radius * 2.0:
+                cam_data.clip_end = distance + radius * 4.0
+        self._aim_camera(cam_obj, center + direction * distance, center)
+
+    @staticmethod
+    def _snapshot_render_settings():
+        """Capture every render/scene setting the render handlers may touch"""
+        scene = bpy.context.scene
+        render = scene.render
+        snap = {
+            "engine": render.engine,
+            "resolution_x": render.resolution_x,
+            "resolution_y": render.resolution_y,
+            "resolution_percentage": render.resolution_percentage,
+            "filepath": render.filepath,
+            "file_format": render.image_settings.file_format,
+            "camera": scene.camera,
+            "frame_current": scene.frame_current,
+        }
+        if hasattr(scene, "cycles") and hasattr(scene.cycles, "samples"):
+            snap["cycles_samples"] = scene.cycles.samples
+        if hasattr(scene, "eevee") and hasattr(scene.eevee, "taa_render_samples"):
+            snap["eevee_samples"] = scene.eevee.taa_render_samples
+        try:
+            snap["shading_type"] = scene.display.shading.type
+        except Exception:
+            pass
+        return snap
+
+    @staticmethod
+    def _restore_render_settings(snap):
+        """Restore settings captured by _snapshot_render_settings (best effort per key)"""
+        scene = bpy.context.scene
+        render = scene.render
+        with suppress(Exception):
+            render.engine = snap["engine"]
+        with suppress(Exception):
+            render.resolution_x = snap["resolution_x"]
+        with suppress(Exception):
+            render.resolution_y = snap["resolution_y"]
+        with suppress(Exception):
+            render.resolution_percentage = snap["resolution_percentage"]
+        with suppress(Exception):
+            render.filepath = snap["filepath"]
+        with suppress(Exception):
+            render.image_settings.file_format = snap["file_format"]
+        with suppress(Exception):
+            scene.camera = snap["camera"]
+        if "cycles_samples" in snap:
+            with suppress(Exception):
+                scene.cycles.samples = snap["cycles_samples"]
+        if "eevee_samples" in snap:
+            with suppress(Exception):
+                scene.eevee.taa_render_samples = snap["eevee_samples"]
+        if "shading_type" in snap:
+            with suppress(Exception):
+                scene.display.shading.type = snap["shading_type"]
+        with suppress(Exception):
+            if scene.frame_current != snap["frame_current"]:
+                scene.frame_set(snap["frame_current"])
+
+    def _opengl_render_to_base64(self, filepath):
+        """OpenGL-render the scene camera to filepath, return the file as base64"""
+        bpy.context.scene.render.filepath = filepath
+        bpy.ops.render.opengl(write_still=True, view_context=False)
+        with open(filepath, "rb") as f:
+            return base64.b64encode(f.read()).decode("utf-8")
+
+    def set_camera(self, action, camera=None, object_names=None, preset=None,
+                   focal_length=None, ortho=False, margin=1.2, location=None, look_at=None):
+        """Create/aim the scene camera: frame objects, apply a view preset, or look at a point"""
+        action = str(action).lower()
+        valid_actions = ("frame_objects", "preset", "look_at")
+        if action not in valid_actions:
+            raise ValueError(f"Unknown action '{action}'. Use one of: {', '.join(valid_actions)}.")
+        scene = bpy.context.scene
+
+        if preset is not None:
+            preset = str(preset).lower()
+            if preset not in CAMERA_PRESETS:
+                raise ValueError(
+                    f"Unknown preset '{preset}'. Valid presets: {', '.join(sorted(CAMERA_PRESETS))}."
+                )
+
+        # Resolve the camera: named, else the scene camera, else create one
+        if camera:
+            cam_obj = self._get_object_or_raise(camera)
+            if cam_obj.type != 'CAMERA':
+                raise ValueError(f"Object '{camera}' is not a camera (type {cam_obj.type}).")
+        elif scene.camera:
+            cam_obj = scene.camera
+        else:
+            cam_data = bpy.data.cameras.new("MCP_Camera")
+            cam_obj = bpy.data.objects.new("MCP_Camera", cam_data)
+            scene.collection.objects.link(cam_obj)
+        scene.camera = cam_obj
+
+        if ortho:
+            cam_obj.data.type = 'ORTHO'
+        if focal_length is not None:
+            cam_obj.data.lens = float(focal_length)
+
+        with suppress(Exception):
+            bpy.context.view_layer.update()
+
+        if action in ("frame_objects", "preset"):
+            if action == "preset" and preset is None:
+                raise ValueError(
+                    f"action 'preset' requires a preset name ({', '.join(sorted(CAMERA_PRESETS))})."
+                )
+            targets = self._resolve_view_targets(object_names)
+            aabb = self._get_world_aabb(targets)
+            if preset:
+                direction = mathutils.Vector(CAMERA_PRESETS[preset])
+            else:
+                # Keep the camera's current view direction (camera looks along local -Z)
+                direction = cam_obj.matrix_world.to_quaternion() @ mathutils.Vector((0.0, 0.0, 1.0))
+            self._frame_camera_on_aabb(cam_obj, aabb, direction, margin)
+        else:  # look_at
+            if location is not None:
+                cam_obj.location = self._check_vec3(location, "location")
+            if look_at is None:
+                raise ValueError(
+                    "action 'look_at' requires look_at: a [x, y, z] point or an object name."
+                )
+            if isinstance(look_at, str):
+                target_obj = self._get_object_or_raise(look_at)
+                t_min, t_max = self._get_world_aabb(target_obj)
+                target_point = [(t_min[i] + t_max[i]) / 2.0 for i in range(3)]
+            else:
+                target_point = self._check_vec3(look_at, "look_at")
+            self._aim_camera(cam_obj, list(cam_obj.location), target_point)
+
+        with suppress(Exception):
+            bpy.context.view_layer.update()
+
+        return {
+            "camera": cam_obj.name,
+            "location": self._vec_list(cam_obj.location),
+            "rotation_euler": self._vec_list(cam_obj.rotation_euler),
+            "focal_length": round(float(cam_obj.data.lens), 4),
+            "is_scene_camera": True,
+        }
+
+    def render_preview(self, object_names=None, angles=None, max_size=800, shading="SOLID"):
+        """OpenGL-render the target objects from preset angles using a temp camera"""
+        if angles is None:
+            angles = ["front", "right", "top", "isometric"]
+        if isinstance(angles, str):
+            angles = [angles]
+        if not angles:
+            raise ValueError("angles must be a non-empty list of preset names.")
+        angles = [str(a).lower() for a in angles][:10]
+        for angle in angles:
+            if angle not in CAMERA_PRESETS:
+                raise ValueError(
+                    f"Unknown angle '{angle}'. Valid angles: {', '.join(sorted(CAMERA_PRESETS))}."
+                )
+        shading = str(shading).upper()
+        if shading not in ("SOLID", "MATERIAL"):
+            raise ValueError(f"Invalid shading '{shading}'. Use 'SOLID' or 'MATERIAL'.")
+
+        scene = bpy.context.scene
+        size = max(64, min(int(max_size), 2048))
+        targets = self._resolve_view_targets(object_names)
+        with suppress(Exception):
+            bpy.context.view_layer.update()
+        aabb = self._get_world_aabb(targets)
+
+        snap = self._snapshot_render_settings()
+        cam_obj = self._create_temp_camera()
+        temp_files = []
+        images = []
+        try:
+            render = scene.render
+            render.resolution_x = size
+            render.resolution_y = size
+            render.resolution_percentage = 100
+            render.image_settings.file_format = 'PNG'
+            scene.camera = cam_obj
+            if shading == "MATERIAL" and hasattr(scene, "display") and hasattr(scene.display, "shading"):
+                with suppress(Exception):
+                    scene.display.shading.type = 'MATERIAL'
+
+            for i, angle in enumerate(angles):
+                self._frame_camera_on_aabb(cam_obj, aabb, CAMERA_PRESETS[angle], 1.2)
+                with suppress(Exception):
+                    bpy.context.view_layer.update()
+                filepath = os.path.join(
+                    tempfile.gettempdir(),
+                    f"blendermcp_preview_{os.getpid()}_{int(time.time() * 1000)}_{i}.png"
+                )
+                temp_files.append(filepath)
+                images.append({
+                    "angle": angle,
+                    "image_data": self._opengl_render_to_base64(filepath),
+                    "format": "png",
+                    "width": size,
+                    "height": size,
+                })
+        finally:
+            self._remove_temp_camera(cam_obj)
+            for filepath in temp_files:
+                with suppress(Exception):
+                    if os.path.exists(filepath):
+                        os.remove(filepath)
+            self._restore_render_settings(snap)
+
+        return {"images": images}
+
+    def render_animation_preview(self, frame_start=None, frame_end=None, num_frames=6,
+                                 max_size=512, camera=None):
+        """OpenGL-render evenly sampled frames of the animation from the scene camera"""
+        scene = bpy.context.scene
+        frame_start = scene.frame_start if frame_start is None else int(frame_start)
+        frame_end = scene.frame_end if frame_end is None else int(frame_end)
+        if frame_end < frame_start:
+            frame_start, frame_end = frame_end, frame_start
+        num_frames = max(1, min(int(num_frames), 10))
+        size = max(64, min(int(max_size), 2048))
+        cam_obj = self._resolve_render_camera(camera)
+
+        # Sample frames evenly, always including the first and last
+        if num_frames == 1 or frame_end == frame_start:
+            frames = [frame_start]
+        else:
+            span = frame_end - frame_start
+            frames = sorted({
+                frame_start + int(round(span * i / (num_frames - 1)))
+                for i in range(num_frames)
+            })
+
+        snap = self._snapshot_render_settings()
+        temp_files = []
+        images = []
+        try:
+            render = scene.render
+            render.resolution_x = size
+            render.resolution_y = size
+            render.resolution_percentage = 100
+            render.image_settings.file_format = 'PNG'
+            scene.camera = cam_obj
+
+            for i, frame in enumerate(frames):
+                scene.frame_set(frame)
+                filepath = os.path.join(
+                    tempfile.gettempdir(),
+                    f"blendermcp_animprev_{os.getpid()}_{int(time.time() * 1000)}_{i}.png"
+                )
+                temp_files.append(filepath)
+                images.append({
+                    "frame": frame,
+                    "image_data": self._opengl_render_to_base64(filepath),
+                    "format": "png",
+                    "width": size,
+                    "height": size,
+                })
+        finally:
+            for filepath in temp_files:
+                with suppress(Exception):
+                    if os.path.exists(filepath):
+                        os.remove(filepath)
+            # Also restores the original current frame
+            self._restore_render_settings(snap)
+
+        return {"frames_sampled": frames, "images": images}
+
+    def render_image(self, camera=None, resolution_x=960, resolution_y=540,
+                     samples=None, engine=None, format="PNG"):
+        """Full render through the render engine, returned as a base64 image"""
+        scene = bpy.context.scene
+        cam_obj = self._resolve_render_camera(camera)
+
+        fmt = str(format).upper().lstrip(".")
+        if fmt in ("JPG", "JPEG"):
+            fmt, file_format, ext = "jpeg", "JPEG", "jpg"
+        elif fmt == "PNG":
+            fmt, file_format, ext = "png", "PNG", "png"
+        else:
+            raise ValueError(f"Invalid format '{format}'. Use 'PNG' or 'JPEG'.")
+
+        res_x = max(16, min(int(resolution_x), 3840))
+        res_y = max(16, min(int(resolution_y), 3840))
+
+        snap = self._snapshot_render_settings()
+        filepath = os.path.join(
+            tempfile.gettempdir(),
+            f"blendermcp_render_{os.getpid()}_{int(time.time() * 1000)}.{ext}"
+        )
+        try:
+            render = scene.render
+            if engine is not None:
+                wanted = str(engine).upper()
+                if wanted in ("EEVEE", "BLENDER_EEVEE", "BLENDER_EEVEE_NEXT"):
+                    # EEVEE engine id differs across Blender versions
+                    candidates = ["BLENDER_EEVEE_NEXT", "BLENDER_EEVEE"]
+                else:
+                    candidates = [wanted]
+                for candidate in candidates:
+                    try:
+                        render.engine = candidate
+                        break
+                    except Exception:
+                        continue
+                else:
+                    raise ValueError(
+                        f"Render engine '{engine}' is not available. Use 'CYCLES' or 'EEVEE'."
+                    )
+            if samples is not None:
+                samples = int(samples)
+                if render.engine == 'CYCLES':
+                    if hasattr(scene, "cycles") and hasattr(scene.cycles, "samples"):
+                        scene.cycles.samples = samples
+                elif hasattr(scene, "eevee") and hasattr(scene.eevee, "taa_render_samples"):
+                    scene.eevee.taa_render_samples = samples
+            render.resolution_x = res_x
+            render.resolution_y = res_y
+            render.resolution_percentage = 100
+            render.image_settings.file_format = file_format
+            render.filepath = filepath
+            scene.camera = cam_obj
+
+            bpy.ops.render.render(write_still=True)
+
+            with open(filepath, "rb") as f:
+                image_data = base64.b64encode(f.read()).decode("utf-8")
+        finally:
+            with suppress(Exception):
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+            self._restore_render_settings(snap)
+
+        return {"image_data": image_data, "format": fmt, "width": res_x, "height": res_y}
+
+    # ------------------------------------------------------------------
+    # Pipeline handlers (C4)
+    # ------------------------------------------------------------------
+
+    def export_scene(self, filepath, format=None, selected_objects=None,
+                     apply_modifiers=True, export_animations=True):
+        """Export the scene (or selected objects) to glb/gltf/fbx/obj/usd"""
+        if not filepath:
+            raise ValueError("filepath is required (e.g. 'C:/exports/scene.glb').")
+        filepath = os.path.abspath(bpy.path.abspath(filepath))
+        fmt = (format or os.path.splitext(filepath)[1].lstrip(".")).lower().lstrip(".")
+        valid_formats = ("glb", "gltf", "fbx", "obj", "usd", "usdc", "usda")
+        if not fmt:
+            raise ValueError(
+                "Could not infer the format: pass format or use a filepath with an "
+                "extension (.glb, .gltf, .fbx, .obj, .usd)."
+            )
+        if fmt not in valid_formats:
+            raise ValueError(f"Unsupported format '{fmt}'. Use one of: {', '.join(valid_formats)}.")
+        if not os.path.splitext(filepath)[1]:
+            filepath += f".{fmt}"
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
+        use_selection = bool(selected_objects)
+        if use_selection:
+            if isinstance(selected_objects, str):
+                selected_objects = [selected_objects]
+            objs = [self._get_object_or_raise(n) for n in selected_objects]
+            self._ensure_object_mode()
+            for obj in bpy.context.view_layer.objects:
+                with suppress(Exception):
+                    obj.select_set(False)
+            for obj in objs:
+                try:
+                    obj.select_set(True)
+                except Exception as e:
+                    raise ValueError(
+                        f"Cannot select '{obj.name}' for export (is it hidden?): {str(e)}"
+                    )
+            bpy.context.view_layer.objects.active = objs[0]
+            objects_exported = len(objs)
+        else:
+            objects_exported = len(bpy.context.scene.objects)
+
+        try:
+            if fmt in ("glb", "gltf"):
+                bpy.ops.export_scene.gltf(
+                    filepath=filepath,
+                    export_format='GLTF_SEPARATE' if fmt == "gltf" else 'GLB',
+                    use_selection=use_selection,
+                    export_apply=bool(apply_modifiers),
+                    export_animations=bool(export_animations),
+                )
+            elif fmt == "fbx":
+                bpy.ops.export_scene.fbx(
+                    filepath=filepath,
+                    use_selection=use_selection,
+                    use_mesh_modifiers=bool(apply_modifiers),
+                    bake_anim=bool(export_animations),
+                )
+            elif fmt == "obj":
+                bpy.ops.wm.obj_export(
+                    filepath=filepath,
+                    export_selected_objects=use_selection,
+                )
+            else:  # usd / usdc / usda
+                bpy.ops.wm.usd_export(
+                    filepath=filepath,
+                    selected_objects_only=use_selection,
+                )
+        except Exception as e:
+            raise Exception(f"Export failed ({fmt}): {str(e)}")
+
+        if not os.path.exists(filepath):
+            raise Exception(
+                f"Export finished but no file was written at {filepath}. Check the path is writable."
+            )
+        return {
+            "filepath": filepath,
+            "format": fmt,
+            "size_bytes": os.path.getsize(filepath),
+            "objects_exported": objects_exported,
+        }
+
+    def import_local_asset(self, filepath, target_size=None, collection=None):
+        """Import a local model file (.glb/.gltf/.fbx/.obj/.usd*/.blend) into the scene"""
+        if not filepath:
+            raise ValueError("filepath is required.")
+        filepath = os.path.abspath(bpy.path.abspath(filepath))
+        if not os.path.exists(filepath):
+            raise ValueError(f"File not found: {filepath}")
+        ext = os.path.splitext(filepath)[1].lower().lstrip(".")
+
+        target_col = None
+        if collection:
+            target_col = bpy.data.collections.get(collection)
+            if target_col is None:
+                raise ValueError(
+                    f"Collection '{collection}' not found. Use organize_scene create_collection first."
+                )
+
+        existing = set(bpy.data.objects)
+        self._ensure_object_mode()
+
+        try:
+            if ext in ("glb", "gltf"):
+                bpy.ops.import_scene.gltf(filepath=filepath)
+            elif ext == "fbx":
+                bpy.ops.import_scene.fbx(filepath=filepath)
+            elif ext == "obj":
+                if hasattr(bpy.ops.wm, "obj_import"):
+                    bpy.ops.wm.obj_import(filepath=filepath)
+                else:
+                    bpy.ops.import_scene.obj(filepath=filepath)
+            elif ext in ("usd", "usdc", "usda", "usdz"):
+                bpy.ops.wm.usd_import(filepath=filepath)
+            elif ext == "blend":
+                # Append all objects from the .blend file
+                with bpy.data.libraries.load(filepath, link=False) as (data_from, data_to):
+                    data_to.objects = data_from.objects
+                for obj in data_to.objects:
+                    if obj is not None:
+                        bpy.context.scene.collection.objects.link(obj)
+            else:
+                raise ValueError(
+                    f"Unsupported file type '.{ext}'. Supported: .glb, .gltf, .fbx, .obj, "
+                    f".usd/.usdc/.usda/.usdz, .blend"
+                )
+        except ValueError:
+            raise
+        except Exception as e:
+            raise Exception(f"Import failed for {filepath}: {str(e)}")
+
+        with suppress(Exception):
+            bpy.context.view_layer.update()
+
+        imported = [obj for obj in bpy.data.objects if obj not in existing]
+        if not imported:
+            raise Exception("Import finished but no new objects were added to the scene.")
+        imported_set = set(imported)
+        roots = [obj for obj in imported if obj.parent not in imported_set]
+
+        scale_applied = 1.0
+        aabb = self._get_world_aabb(imported)
+        if target_size is not None:
+            target_size = float(target_size)
+            max_dim = max(aabb[1][i] - aabb[0][i] for i in range(3))
+            if target_size > 0 and max_dim > 0:
+                scale_applied = target_size / max_dim
+                # Scale only root objects: children inherit through matrix_world
+                for root in roots:
+                    root.scale = [root.scale[i] * scale_applied for i in range(3)]
+                with suppress(Exception):
+                    bpy.context.view_layer.update()
+                aabb = self._get_world_aabb(imported)
+
+        if target_col is not None:
+            for obj in imported:
+                for col in list(obj.users_collection):
+                    with suppress(Exception):
+                        col.objects.unlink(obj)
+                with suppress(Exception):
+                    target_col.objects.link(obj)
+
+        result = {
+            "imported_objects": [obj.name for obj in imported][:100],
+            "dimensions": [round(aabb[1][i] - aabb[0][i], 4) for i in range(3)],
+            "world_bounding_box": [self._vec_list(aabb[0]), self._vec_list(aabb[1])],
+        }
+        if len(imported) > 100:
+            result["total_count"] = len(imported)
+        if target_size is not None:
+            result["scale_applied"] = round(scale_applied, 6)
+        if target_col is not None:
+            result["collection"] = target_col.name
+        return result
+
+    def manage_project(self, action, filepath=None):
+        """Save/open/version the .blend project"""
+        action = str(action).lower()
+        valid_actions = ("save", "save_as", "save_version", "open", "new")
+        if action not in valid_actions:
+            raise ValueError(f"Unknown action '{action}'. Use one of: {', '.join(valid_actions)}.")
+
+        if filepath:
+            filepath = os.path.abspath(bpy.path.abspath(filepath))
+
+        if action == "save":
+            try:
+                if filepath:
+                    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+                    bpy.ops.wm.save_mainfile(filepath=filepath)
+                elif bpy.data.filepath:
+                    bpy.ops.wm.save_mainfile()
+                else:
+                    raise ValueError(
+                        "The project has never been saved. Call manage_project with "
+                        "action 'save_as' and a filepath ending in .blend."
+                    )
+            except ValueError:
+                raise
+            except Exception as e:
+                raise Exception(f"Save failed: {str(e)}")
+            return {"action": action, "filepath": bpy.data.filepath, "ok": True}
+
+        if action == "save_as":
+            if not filepath:
+                raise ValueError("action 'save_as' requires a filepath ending in .blend.")
+            if not filepath.lower().endswith(".blend"):
+                filepath += ".blend"
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            try:
+                bpy.ops.wm.save_as_mainfile(filepath=filepath)
+            except Exception as e:
+                raise Exception(f"Save As failed: {str(e)}")
+            return {"action": action, "filepath": bpy.data.filepath, "ok": True}
+
+        if action == "save_version":
+            current = bpy.data.filepath
+            if not current:
+                raise ValueError(
+                    "save_version requires a saved project. Use action 'save_as' first."
+                )
+            stem = os.path.splitext(os.path.basename(current))[0]
+            versions_dir = os.path.join(os.path.dirname(current), "versions")
+            os.makedirs(versions_dir, exist_ok=True)
+            pattern = re.compile(re.escape(stem) + r"_v(\d+)\.blend$", re.IGNORECASE)
+            highest = 0
+            for fname in os.listdir(versions_dir):
+                match = pattern.match(fname)
+                if match:
+                    highest = max(highest, int(match.group(1)))
+            version_path = os.path.join(versions_dir, f"{stem}_v{highest + 1:03d}.blend")
+            try:
+                bpy.ops.wm.save_as_mainfile(filepath=version_path, copy=True)
+            except Exception as e:
+                raise Exception(f"Version save failed: {str(e)}")
+            return {"action": action, "filepath": version_path, "ok": True}
+
+        if action == "open":
+            if not filepath:
+                raise ValueError("action 'open' requires a filepath to a .blend file.")
+            if not os.path.exists(filepath):
+                raise ValueError(f"File not found: {filepath}")
+            try:
+                bpy.ops.wm.open_mainfile(filepath=filepath)
+            except Exception as e:
+                raise Exception(f"Open failed: {str(e)}")
+            return {"action": action, "filepath": bpy.data.filepath, "ok": True}
+
+        # action == "new"
+        try:
+            bpy.ops.wm.read_homefile(use_empty=False)
+        except Exception as e:
+            raise Exception(f"New file failed: {str(e)}")
+        return {"action": action, "filepath": None, "ok": True}
 
     def get_polyhaven_categories(self, asset_type):
         """Get categories for a specific asset type from Polyhaven"""
+        disabled = self._integration_disabled_error("blendermcp_use_polyhaven", "PolyHaven")
+        if disabled:
+            return disabled
         try:
             if asset_type not in ["hdris", "textures", "models", "all"]:
                 return {"error": f"Invalid asset type: {asset_type}. Must be one of: hdris, textures, models, all"}
 
-            response = requests.get(f"https://api.polyhaven.com/categories/{asset_type}", headers=REQ_HEADERS)
+            response = requests.get(f"https://api.polyhaven.com/categories/{asset_type}", headers=REQ_HEADERS, timeout=(10, 60))
             if response.status_code == 200:
                 return {"categories": response.json()}
             else:
@@ -453,6 +2677,9 @@ class BlenderMCPServer:
 
     def search_polyhaven_assets(self, asset_type=None, categories=None):
         """Search for assets from Polyhaven with optional filtering"""
+        disabled = self._integration_disabled_error("blendermcp_use_polyhaven", "PolyHaven")
+        if disabled:
+            return disabled
         try:
             url = "https://api.polyhaven.com/assets"
             params = {}
@@ -465,7 +2692,7 @@ class BlenderMCPServer:
             if categories:
                 params["categories"] = categories
 
-            response = requests.get(url, params=params, headers=REQ_HEADERS)
+            response = requests.get(url, params=params, headers=REQ_HEADERS, timeout=(10, 60))
             if response.status_code == 200:
                 # Limit the response size to avoid overwhelming Blender
                 assets = response.json()
@@ -483,9 +2710,12 @@ class BlenderMCPServer:
             return {"error": str(e)}
 
     def download_polyhaven_asset(self, asset_id, asset_type, resolution="1k", file_format=None):
+        disabled = self._integration_disabled_error("blendermcp_use_polyhaven", "PolyHaven")
+        if disabled:
+            return disabled
         try:
             # First get the files information
-            files_response = requests.get(f"https://api.polyhaven.com/files/{asset_id}", headers=REQ_HEADERS)
+            files_response = requests.get(f"https://api.polyhaven.com/files/{asset_id}", headers=REQ_HEADERS, timeout=(10, 60))
             if files_response.status_code != 200:
                 return {"error": f"Failed to get asset files: {files_response.status_code}"}
 
@@ -505,7 +2735,7 @@ class BlenderMCPServer:
                     # since Blender can't properly load HDR data directly from memory
                     with tempfile.NamedTemporaryFile(suffix=f".{file_format}", delete=False) as tmp_file:
                         # Download the file
-                        response = requests.get(file_url, headers=REQ_HEADERS)
+                        response = requests.get(file_url, headers=REQ_HEADERS, timeout=(10, 60))
                         if response.status_code != 200:
                             return {"error": f"Failed to download HDRI: {response.status_code}"}
 
@@ -601,7 +2831,7 @@ class BlenderMCPServer:
                                 # Use NamedTemporaryFile like we do for HDRIs
                                 with tempfile.NamedTemporaryFile(suffix=f".{file_format}", delete=False) as tmp_file:
                                     # Download the file
-                                    response = requests.get(file_url, headers=REQ_HEADERS)
+                                    response = requests.get(file_url, headers=REQ_HEADERS, timeout=(10, 60))
                                     if response.status_code == 200:
                                         tmp_file.write(response.content)
                                         tmp_path = tmp_file.name
@@ -738,7 +2968,7 @@ class BlenderMCPServer:
                         main_file_name = file_url.split("/")[-1]
                         main_file_path = os.path.join(temp_dir, main_file_name)
 
-                        response = requests.get(file_url, headers=REQ_HEADERS)
+                        response = requests.get(file_url, headers=REQ_HEADERS, timeout=(10, 60))
                         if response.status_code != 200:
                             return {"error": f"Failed to download model: {response.status_code}"}
 
@@ -756,7 +2986,7 @@ class BlenderMCPServer:
                                 os.makedirs(os.path.dirname(include_file_path), exist_ok=True)
 
                                 # Download the included file
-                                include_response = requests.get(include_url, headers=REQ_HEADERS)
+                                include_response = requests.get(include_url, headers=REQ_HEADERS, timeout=(10, 60))
                                 if include_response.status_code == 200:
                                     with open(include_file_path, "wb") as f:
                                         f.write(include_response.content)
@@ -807,6 +3037,9 @@ class BlenderMCPServer:
 
     def set_texture(self, object_name, texture_id):
         """Apply a previously downloaded Polyhaven texture to an object by creating a new material"""
+        disabled = self._integration_disabled_error("blendermcp_use_polyhaven", "PolyHaven")
+        if disabled:
+            return disabled
         try:
             # Get the object
             obj = bpy.data.objects.get(object_name)
@@ -1143,7 +3376,7 @@ class BlenderMCPServer:
         """Get the current status of Hyper3D Rodin integration"""
         enabled = bpy.context.scene.blendermcp_use_hyper3d
         if enabled:
-            if not bpy.context.scene.blendermcp_hyper3d_api_key:
+            if not get_credential(bpy.context, 'hyper3d_api_key', 'blendermcp_hyper3d_api_key'):
                 return {
                     "enabled": False,
                     "message": """Hyper3D Rodin integration is currently enabled, but API key is not given. To enable it:
@@ -1154,7 +3387,7 @@ class BlenderMCPServer:
                 }
             mode = bpy.context.scene.blendermcp_hyper3d_mode
             message = f"Hyper3D Rodin integration is enabled and ready to use. Mode: {mode}. " + \
-                f"Key type: {'private' if bpy.context.scene.blendermcp_hyper3d_api_key != RODIN_FREE_TRIAL_KEY else 'free_trial'}"
+                f"Key type: {'private' if get_credential(bpy.context, 'hyper3d_api_key', 'blendermcp_hyper3d_api_key') != RODIN_FREE_TRIAL_KEY else 'free_trial'}"
             return {
                 "enabled": True,
                 "message": message
@@ -1169,6 +3402,9 @@ class BlenderMCPServer:
             }
 
     def create_rodin_job(self, *args, **kwargs):
+        disabled = self._integration_disabled_error("blendermcp_use_hyper3d", "Hyper3D Rodin")
+        if disabled:
+            return disabled
         match bpy.context.scene.blendermcp_hyper3d_mode:
             case "MAIN_SITE":
                 return self.create_rodin_job_main_site(*args, **kwargs)
@@ -1200,9 +3436,10 @@ class BlenderMCPServer:
             response = requests.post(
                 "https://hyperhuman.deemos.com/api/v2/rodin",
                 headers={
-                    "Authorization": f"Bearer {bpy.context.scene.blendermcp_hyper3d_api_key}",
+                    "Authorization": f"Bearer {get_credential(bpy.context, 'hyper3d_api_key', 'blendermcp_hyper3d_api_key')}",
                 },
-                files=files
+                files=files,
+                timeout=(10, 60)
             )
             data = response.json()
             return data
@@ -1228,10 +3465,11 @@ class BlenderMCPServer:
             response = requests.post(
                 "https://queue.fal.run/fal-ai/hyper3d/rodin",
                 headers={
-                    "Authorization": f"Key {bpy.context.scene.blendermcp_hyper3d_api_key}",
+                    "Authorization": f"Key {get_credential(bpy.context, 'hyper3d_api_key', 'blendermcp_hyper3d_api_key')}",
                     "Content-Type": "application/json",
                 },
-                json=req_data
+                json=req_data,
+                timeout=(10, 60)
             )
             data = response.json()
             return data
@@ -1239,6 +3477,9 @@ class BlenderMCPServer:
             return {"error": str(e)}
 
     def poll_rodin_job_status(self, *args, **kwargs):
+        disabled = self._integration_disabled_error("blendermcp_use_hyper3d", "Hyper3D Rodin")
+        if disabled:
+            return disabled
         match bpy.context.scene.blendermcp_hyper3d_mode:
             case "MAIN_SITE":
                 return self.poll_rodin_job_status_main_site(*args, **kwargs)
@@ -1252,11 +3493,12 @@ class BlenderMCPServer:
         response = requests.post(
             "https://hyperhuman.deemos.com/api/v2/status",
             headers={
-                "Authorization": f"Bearer {bpy.context.scene.blendermcp_hyper3d_api_key}",
+                "Authorization": f"Bearer {get_credential(bpy.context, 'hyper3d_api_key', 'blendermcp_hyper3d_api_key')}",
             },
             json={
                 "subscription_key": subscription_key,
             },
+            timeout=(10, 60),
         )
         data = response.json()
         return {
@@ -1268,8 +3510,9 @@ class BlenderMCPServer:
         response = requests.get(
             f"https://queue.fal.run/fal-ai/hyper3d/requests/{request_id}/status",
             headers={
-                "Authorization": f"KEY {bpy.context.scene.blendermcp_hyper3d_api_key}",
+                "Authorization": f"KEY {get_credential(bpy.context, 'hyper3d_api_key', 'blendermcp_hyper3d_api_key')}",
             },
+            timeout=(10, 60),
         )
         data = response.json()
         return data
@@ -1342,6 +3585,9 @@ class BlenderMCPServer:
         return mesh_obj
 
     def import_generated_asset(self, *args, **kwargs):
+        disabled = self._integration_disabled_error("blendermcp_use_hyper3d", "Hyper3D Rodin")
+        if disabled:
+            return disabled
         match bpy.context.scene.blendermcp_hyper3d_mode:
             case "MAIN_SITE":
                 return self.import_generated_asset_main_site(*args, **kwargs)
@@ -1355,11 +3601,12 @@ class BlenderMCPServer:
         response = requests.post(
             "https://hyperhuman.deemos.com/api/v2/download",
             headers={
-                "Authorization": f"Bearer {bpy.context.scene.blendermcp_hyper3d_api_key}",
+                "Authorization": f"Bearer {get_credential(bpy.context, 'hyper3d_api_key', 'blendermcp_hyper3d_api_key')}",
             },
             json={
                 'task_uuid': task_uuid
-            }
+            },
+            timeout=(10, 60)
         )
         data_ = response.json()
         temp_file = None
@@ -1373,7 +3620,7 @@ class BlenderMCPServer:
 
                 try:
                     # Download the content
-                    response = requests.get(i["url"], stream=True)
+                    response = requests.get(i["url"], stream=True, timeout=(10, 60))
                     response.raise_for_status()  # Raise an exception for HTTP errors
 
                     # Write the content to the temporary file
@@ -1421,8 +3668,9 @@ class BlenderMCPServer:
         response = requests.get(
             f"https://queue.fal.run/fal-ai/hyper3d/requests/{request_id}",
             headers={
-                "Authorization": f"Key {bpy.context.scene.blendermcp_hyper3d_api_key}",
-            }
+                "Authorization": f"Key {get_credential(bpy.context, 'hyper3d_api_key', 'blendermcp_hyper3d_api_key')}",
+            },
+            timeout=(10, 60)
         )
         data_ = response.json()
         temp_file = None
@@ -1435,7 +3683,7 @@ class BlenderMCPServer:
 
         try:
             # Download the content
-            response = requests.get(data_["model_mesh"]["url"], stream=True)
+            response = requests.get(data_["model_mesh"]["url"], stream=True, timeout=(10, 60))
             response.raise_for_status()  # Raise an exception for HTTP errors
 
             # Write the content to the temporary file
@@ -1479,7 +3727,7 @@ class BlenderMCPServer:
     def get_sketchfab_status(self):
         """Get the current status of Sketchfab integration"""
         enabled = bpy.context.scene.blendermcp_use_sketchfab
-        api_key = bpy.context.scene.blendermcp_sketchfab_api_key
+        api_key = get_credential(bpy.context, 'sketchfab_api_key', 'blendermcp_sketchfab_api_key')
 
         # Test the API key if present
         if api_key:
@@ -1540,8 +3788,11 @@ class BlenderMCPServer:
 
     def search_sketchfab_models(self, query, categories=None, count=20, downloadable=True):
         """Search for models on Sketchfab based on query and optional filters"""
+        disabled = self._integration_disabled_error("blendermcp_use_sketchfab", "Sketchfab")
+        if disabled:
+            return disabled
         try:
-            api_key = bpy.context.scene.blendermcp_sketchfab_api_key
+            api_key = get_credential(bpy.context, 'sketchfab_api_key', 'blendermcp_sketchfab_api_key')
             if not api_key:
                 return {"error": "Sketchfab API key is not configured"}
 
@@ -1602,10 +3853,13 @@ class BlenderMCPServer:
 
     def get_sketchfab_model_preview(self, uid):
         """Get thumbnail preview image of a Sketchfab model by its UID"""
+        disabled = self._integration_disabled_error("blendermcp_use_sketchfab", "Sketchfab")
+        if disabled:
+            return disabled
         try:
             import base64
             
-            api_key = bpy.context.scene.blendermcp_sketchfab_api_key
+            api_key = get_credential(bpy.context, 'sketchfab_api_key', 'blendermcp_sketchfab_api_key')
             if not api_key:
                 return {"error": "Sketchfab API key is not configured"}
 
@@ -1694,8 +3948,11 @@ class BlenderMCPServer:
         - normalize_size: If True, scale the model so its largest dimension equals target_size
         - target_size: The target size in Blender units (meters) for the largest dimension
         """
+        disabled = self._integration_disabled_error("blendermcp_use_sketchfab", "Sketchfab")
+        if disabled:
+            return disabled
         try:
-            api_key = bpy.context.scene.blendermcp_sketchfab_api_key
+            api_key = get_credential(bpy.context, 'sketchfab_api_key', 'blendermcp_sketchfab_api_key')
             if not api_key:
                 return {"error": "Sketchfab API key is not configured"}
 
@@ -1918,7 +4175,7 @@ class BlenderMCPServer:
         if enabled:
             match hunyuan3d_mode:
                 case "OFFICIAL_API":
-                    if not bpy.context.scene.blendermcp_hunyuan3d_secret_id or not bpy.context.scene.blendermcp_hunyuan3d_secret_key:
+                    if not get_credential(bpy.context, 'hunyuan3d_secret_id', 'blendermcp_hunyuan3d_secret_id') or not get_credential(bpy.context, 'hunyuan3d_secret_key', 'blendermcp_hunyuan3d_secret_key'):
                         return {
                             "enabled": False, 
                             "mode": hunyuan3d_mode, 
@@ -2039,6 +4296,9 @@ class BlenderMCPServer:
         return headers, endpoint
 
     def create_hunyuan_job(self, *args, **kwargs):
+        disabled = self._integration_disabled_error("blendermcp_use_hunyuan3d", "Hunyuan3D")
+        if disabled:
+            return disabled
         match bpy.context.scene.blendermcp_hunyuan3d_mode:
             case "OFFICIAL_API":
                 return self.create_hunyuan_job_main_site(*args, **kwargs)
@@ -2053,8 +4313,8 @@ class BlenderMCPServer:
         image: str = None
     ):
         try:
-            secret_id = bpy.context.scene.blendermcp_hunyuan3d_secret_id
-            secret_key = bpy.context.scene.blendermcp_hunyuan3d_secret_key
+            secret_id = get_credential(bpy.context, 'hunyuan3d_secret_id', 'blendermcp_hunyuan3d_secret_id')
+            secret_key = get_credential(bpy.context, 'hunyuan3d_secret_key', 'blendermcp_hunyuan3d_secret_key')
 
             if not secret_id or not secret_key:
                 return {"error": "SecretId or SecretKey is not given"}
@@ -2106,7 +4366,8 @@ class BlenderMCPServer:
             response = requests.post(
                 endpoint,
                 headers = headers,
-                data = json.dumps(data)
+                data = json.dumps(data),
+                timeout=(10, 60)
             )
 
             if response.status_code == 200:
@@ -2150,7 +4411,7 @@ class BlenderMCPServer:
             if image:
                 if re.match(r'^https?://', image, re.IGNORECASE) is not None:
                     try:
-                        resImg = requests.get(image)
+                        resImg = requests.get(image, timeout=(10, 60))
                         resImg.raise_for_status()
                         image_base64 = base64.b64encode(resImg.content).decode("ascii")
                         data["image"] = image_base64
@@ -2168,6 +4429,7 @@ class BlenderMCPServer:
             response = requests.post(
                 f"{base_url}/generate",
                 json = data,
+                timeout=(10, 60),
             )
 
             if response.status_code != 200:
@@ -2198,14 +4460,17 @@ class BlenderMCPServer:
         
     
     def poll_hunyuan_job_status(self, *args, **kwargs):
+        disabled = self._integration_disabled_error("blendermcp_use_hunyuan3d", "Hunyuan3D")
+        if disabled:
+            return disabled
         return self.poll_hunyuan_job_status_ai(*args, **kwargs)
     
     def poll_hunyuan_job_status_ai(self, job_id: str):
         """Call the job status API to get the job status"""
         print(job_id)
         try:
-            secret_id = bpy.context.scene.blendermcp_hunyuan3d_secret_id
-            secret_key = bpy.context.scene.blendermcp_hunyuan3d_secret_key
+            secret_id = get_credential(bpy.context, 'hunyuan3d_secret_id', 'blendermcp_hunyuan3d_secret_id')
+            secret_key = get_credential(bpy.context, 'hunyuan3d_secret_key', 'blendermcp_hunyuan3d_secret_key')
 
             if not secret_id or not secret_key:
                 return {"error": "SecretId or SecretKey is not given"}
@@ -2233,7 +4498,8 @@ class BlenderMCPServer:
             response = requests.post(
                 endpoint,
                 headers=headers,
-                data=json.dumps(data)
+                data=json.dumps(data),
+                timeout=(10, 60)
             )
 
             if response.status_code == 200:
@@ -2245,6 +4511,9 @@ class BlenderMCPServer:
             return {"error": str(e)}
 
     def import_generated_asset_hunyuan(self, *args, **kwargs):
+        disabled = self._integration_disabled_error("blendermcp_use_hunyuan3d", "Hunyuan3D")
+        if disabled:
+            return disabled
         return self.import_generated_asset_hunyuan_ai(*args, **kwargs)
             
     def import_generated_asset_hunyuan_ai(self, name: str , zip_file_url: str):
@@ -2263,7 +4532,7 @@ class BlenderMCPServer:
 
         try:
             # Download ZIP file
-            zip_response = requests.get(zip_file_url, stream=True)
+            zip_response = requests.get(zip_file_url, stream=True, timeout=(10, 60))
             zip_response.raise_for_status()
             with open(zip_file_path, "wb") as f:
                 for chunk in zip_response.iter_content(chunk_size=8192):
@@ -2331,9 +4600,46 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
         default=True
     )
 
+    sketchfab_api_key: StringProperty(
+        name="Sketchfab API Key",
+        subtype='PASSWORD',
+        description="API Key provided by Sketchfab (stored in Blender preferences, not in .blend files)",
+        default=""
+    )
+
+    hyper3d_api_key: StringProperty(
+        name="Hyper3D API Key",
+        subtype='PASSWORD',
+        description="API Key provided by Hyper3D (stored in Blender preferences, not in .blend files)",
+        default=""
+    )
+
+    hunyuan3d_secret_id: StringProperty(
+        name="Hunyuan 3D SecretId",
+        subtype='PASSWORD',
+        description="SecretId provided by Hunyuan 3D (stored in Blender preferences, not in .blend files)",
+        default=""
+    )
+
+    hunyuan3d_secret_key: StringProperty(
+        name="Hunyuan 3D SecretKey",
+        subtype='PASSWORD',
+        description="SecretKey provided by Hunyuan 3D (stored in Blender preferences, not in .blend files)",
+        default=""
+    )
+
     def draw(self, context):
         layout = self.layout
-        
+
+        # API keys section
+        layout.label(text="API Keys:", icon='LOCKED')
+        box = layout.box()
+        box.prop(self, "sketchfab_api_key")
+        box.prop(self, "hyper3d_api_key")
+        box.prop(self, "hunyuan3d_secret_id")
+        box.prop(self, "hunyuan3d_secret_key")
+        box.label(text="Keys are stored in Blender preferences, not in .blend files", icon='INFO')
+
         # Telemetry section
         layout.label(text="Telemetry & Privacy:", icon='PREFERENCES')
         
@@ -2367,38 +4673,115 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         scene = context.scene
+        server = getattr(bpy.types, "blendermcp_server", None)
+        addon_entry = context.preferences.addons.get(__name__)
+        prefs = addon_entry.preferences if addon_entry else None
+        paused = getattr(scene, "blendermcp_paused", False)
 
-        layout.prop(scene, "blendermcp_port")
-        layout.prop(scene, "blendermcp_use_polyhaven", text="Use assets from Poly Haven")
-
-        layout.prop(scene, "blendermcp_use_hyper3d", text="Use Hyper3D Rodin 3D model generation")
-        if scene.blendermcp_use_hyper3d:
-            layout.prop(scene, "blendermcp_hyper3d_mode", text="Rodin Mode")
-            layout.prop(scene, "blendermcp_hyper3d_api_key", text="API Key")
-            layout.operator("blendermcp.set_hyper3d_free_trial_api_key", text="Set Free Trial API Key")
-
-        layout.prop(scene, "blendermcp_use_sketchfab", text="Use assets from Sketchfab")
-        if scene.blendermcp_use_sketchfab:
-            layout.prop(scene, "blendermcp_sketchfab_api_key", text="API Key")
-
-        layout.prop(scene, "blendermcp_use_hunyuan3d", text="Use Tencent Hunyuan 3D model generation")
-        if scene.blendermcp_use_hunyuan3d:
-            layout.prop(scene, "blendermcp_hunyuan3d_mode", text="Hunyuan3D Mode")
-            if scene.blendermcp_hunyuan3d_mode == 'OFFICIAL_API':
-                layout.prop(scene, "blendermcp_hunyuan3d_secret_id", text="SecretId")
-                layout.prop(scene, "blendermcp_hunyuan3d_secret_key", text="SecretKey")
-            if scene.blendermcp_hunyuan3d_mode == 'LOCAL_API':
-                layout.prop(scene, "blendermcp_hunyuan3d_api_url", text="API URL")
-                layout.prop(scene, "blendermcp_hunyuan3d_octree_resolution", text="Octree Resolution")
-                layout.prop(scene, "blendermcp_hunyuan3d_num_inference_steps", text="Number of Inference Steps")
-                layout.prop(scene, "blendermcp_hunyuan3d_guidance_scale", text="Guidance Scale")
-                layout.prop(scene, "blendermcp_hunyuan3d_texture", text="Generate Texture")
-        
-        if not scene.blendermcp_server_running:
-            layout.operator("blendermcp.start_server", text="Connect to MCP server")
+        # --- Status box ---
+        box = layout.box()
+        if server and server.running:
+            # Truthful port: read from the server object, not the scene prop
+            box.label(text=f"Server running on port {server.port}", icon='CHECKMARK')
+            if paused:
+                box.label(text="Paused - commands are rejected", icon='PAUSE')
+            if server.client_connected and server.client_address:
+                box.label(text=f"Client connected: {server.client_address}", icon='LINKED')
+            else:
+                box.label(text="Waiting for client...", icon='UNLINKED')
+            if server.commands_executed:
+                last = server.last_command_type or "-"
+                age = ""
+                if server.last_command_time:
+                    age = f" ({int(time.time() - server.last_command_time)}s ago)"
+                box.label(text=f"Commands: {server.commands_executed} · Last: {last}{age}", icon='INFO')
+            if server.last_error:
+                row = box.row()
+                row.alert = True
+                err_cmd = server.last_error.get("command") or "?"
+                err_msg = str(server.last_error.get("message") or "")[:64]
+                row.label(text=f"{err_cmd}: {err_msg}", icon='ERROR')
+                row.operator("blendermcp.dismiss_error", text="", icon='X')
         else:
-            layout.operator("blendermcp.stop_server", text="Disconnect from MCP server")
-            layout.label(text=f"Running on port {scene.blendermcp_port}")
+            box.label(text="Server not running", icon='CANCEL')
+
+        # --- Controls row ---
+        row = layout.row(align=True)
+        if not scene.blendermcp_server_running:
+            row.operator("blendermcp.start_server", text="Connect", icon='PLAY')
+        else:
+            row.operator("blendermcp.stop_server", text="Disconnect", icon='X')
+        row.prop(scene, "blendermcp_paused",
+                 text="Resume" if paused else "Pause",
+                 toggle=True,
+                 icon='PLAY' if paused else 'PAUSE')
+        layout.operator("blendermcp.undo_last_ai", text="Undo AI Action", icon='LOOP_BACK')
+
+        # --- Port row (locked while running) ---
+        row = layout.row(align=True)
+        sub = row.row(align=True)
+        sub.enabled = not scene.blendermcp_server_running
+        sub.prop(scene, "blendermcp_port")
+        row.prop(scene, "blendermcp_auto_start_server", text="Auto-start")
+
+        # --- Activity log box ---
+        box = layout.box()
+        box.prop(scene, "blendermcp_show_activity",
+                 text="Activity",
+                 icon='TRIA_DOWN' if scene.blendermcp_show_activity else 'TRIA_RIGHT',
+                 emboss=False)
+        if scene.blendermcp_show_activity:
+            if server and server.activity_log:
+                entries = list(server.activity_log)[-8:]
+                for entry in reversed(entries):
+                    icon = 'CHECKMARK' if entry.get("status") == "ok" else 'ERROR'
+                    text = f"[{entry.get('time')}] {entry.get('type')} ({entry.get('duration_ms')}ms)"
+                    summary = entry.get("summary") or ""
+                    if summary and summary != entry.get("type"):
+                        text += f" — {summary}"
+                    box.label(text=text[:120], icon=icon)
+                box.operator("blendermcp.dump_log", text="Copy Log to Text Editor", icon='TEXT')
+            else:
+                box.label(text="No activity yet", icon='INFO')
+
+        # --- Integrations box (keys come from addon preferences) ---
+        box = layout.box()
+        box.label(text="Integrations", icon='WORLD')
+
+        box.prop(scene, "blendermcp_use_polyhaven", text="Use assets from Poly Haven")
+
+        box.prop(scene, "blendermcp_use_hyper3d", text="Use Hyper3D Rodin 3D model generation")
+        if scene.blendermcp_use_hyper3d:
+            box.prop(scene, "blendermcp_hyper3d_mode", text="Rodin Mode")
+            if prefs is not None:
+                box.prop(prefs, "hyper3d_api_key", text="API Key")
+            box.operator("blendermcp.set_hyper3d_free_trial_api_key", text="Set Free Trial API Key")
+
+        box.prop(scene, "blendermcp_use_sketchfab", text="Use assets from Sketchfab")
+        if scene.blendermcp_use_sketchfab and prefs is not None:
+            box.prop(prefs, "sketchfab_api_key", text="API Key")
+
+        box.prop(scene, "blendermcp_use_hunyuan3d", text="Use Tencent Hunyuan 3D model generation")
+        if scene.blendermcp_use_hunyuan3d:
+            box.prop(scene, "blendermcp_hunyuan3d_mode", text="Hunyuan3D Mode")
+            if scene.blendermcp_hunyuan3d_mode == 'OFFICIAL_API' and prefs is not None:
+                box.prop(prefs, "hunyuan3d_secret_id", text="SecretId")
+                box.prop(prefs, "hunyuan3d_secret_key", text="SecretKey")
+            if scene.blendermcp_hunyuan3d_mode == 'LOCAL_API':
+                box.prop(scene, "blendermcp_hunyuan3d_api_url", text="API URL")
+                box.prop(scene, "blendermcp_hunyuan3d_octree_resolution", text="Octree Resolution")
+                box.prop(scene, "blendermcp_hunyuan3d_num_inference_steps", text="Number of Inference Steps")
+                box.prop(scene, "blendermcp_hunyuan3d_guidance_scale", text="Guidance Scale")
+                box.prop(scene, "blendermcp_hunyuan3d_texture", text="Generate Texture")
+
+        box.label(text="Keys are stored in Blender preferences, not in .blend files", icon='INFO')
+
+        # --- Telemetry row ---
+        row = layout.row()
+        consent = bool(prefs.telemetry_consent) if prefs is not None else True
+        row.label(text=f"Telemetry: {'On' if consent else 'Off'}",
+                  icon='RADIOBUT_ON' if consent else 'RADIOBUT_OFF')
+        row.operator("blendermcp.open_prefs", text="", icon='PREFERENCES')
 
 # Operator to set Hyper3D API Key
 class BLENDERMCP_OT_SetFreeTrialHyper3DAPIKey(bpy.types.Operator):
@@ -2406,7 +4789,11 @@ class BLENDERMCP_OT_SetFreeTrialHyper3DAPIKey(bpy.types.Operator):
     bl_label = "Set Free Trial API Key"
 
     def execute(self, context):
-        context.scene.blendermcp_hyper3d_api_key = RODIN_FREE_TRIAL_KEY
+        addon_entry = context.preferences.addons.get(__name__)
+        if addon_entry:
+            addon_entry.preferences.hyper3d_api_key = RODIN_FREE_TRIAL_KEY
+        else:
+            context.scene.blendermcp_hyper3d_api_key = RODIN_FREE_TRIAL_KEY
         context.scene.blendermcp_hyper3d_mode = 'MAIN_SITE'
         self.report({'INFO'}, "API Key set successfully!")
         return {'FINISHED'}
@@ -2466,6 +4853,93 @@ class BLENDERMCP_OT_OpenTerms(bpy.types.Operator):
         
         return {'FINISHED'}
 
+# Operator to dismiss the last error shown in the panel status box
+class BLENDERMCP_OT_DismissError(bpy.types.Operator):
+    bl_idname = "blendermcp.dismiss_error"
+    bl_label = "Dismiss Error"
+    bl_description = "Clear the last MCP error shown in the panel"
+
+    @classmethod
+    def poll(cls, context):
+        server = getattr(bpy.types, "blendermcp_server", None)
+        return server is not None and server.last_error is not None
+
+    def execute(self, context):
+        server = getattr(bpy.types, "blendermcp_server", None)
+        if server is not None:
+            server.last_error = None
+        return {'FINISHED'}
+
+# Operator to undo the last AI (MCP) action
+class BLENDERMCP_OT_UndoLastAI(bpy.types.Operator):
+    bl_idname = "blendermcp.undo_last_ai"
+    bl_label = "Undo AI Action"
+    bl_description = "Undo the last change made via MCP (an undo checkpoint is pushed before every mutating command)"
+
+    @classmethod
+    def poll(cls, context):
+        return getattr(bpy.types, "blendermcp_server", None) is not None
+
+    def execute(self, context):
+        try:
+            # Push a step for the current state first so a single undo lands on
+            # the pre-command checkpoint (ed.undo restores the step before the
+            # active one) instead of also reverting the previous command.
+            try:
+                bpy.ops.ed.undo_push(message="MCP: undo AI action")
+            except Exception:
+                pass
+            bpy.ops.ed.undo()
+        except Exception as e:
+            self.report({'ERROR'}, f"Undo failed: {str(e)}")
+            return {'CANCELLED'}
+        self.report({'INFO'}, "Undid last AI action")
+        return {'FINISHED'}
+
+# Operator to dump the full activity log to a text datablock
+class BLENDERMCP_OT_DumpLog(bpy.types.Operator):
+    bl_idname = "blendermcp.dump_log"
+    bl_label = "Copy Log to Text Editor"
+    bl_description = "Write the full MCP activity log to the 'MCP_Activity_Log' text datablock"
+
+    @classmethod
+    def poll(cls, context):
+        server = getattr(bpy.types, "blendermcp_server", None)
+        return server is not None and len(server.activity_log) > 0
+
+    def execute(self, context):
+        server = getattr(bpy.types, "blendermcp_server", None)
+        if server is None:
+            return {'CANCELLED'}
+        text = bpy.data.texts.get("MCP_Activity_Log")
+        if text is None:
+            text = bpy.data.texts.new("MCP_Activity_Log")
+        text.clear()
+        lines = [f"BlenderMCP activity log ({time.strftime('%Y-%m-%d %H:%M:%S')})"]
+        for entry in server.activity_log:
+            mark = "OK " if entry.get("status") == "ok" else "ERR"
+            lines.append(
+                f"[{entry.get('time')}] {mark} {entry.get('type')} "
+                f"({entry.get('duration_ms')}ms) - {entry.get('summary') or ''}"
+            )
+        text.write("\n".join(lines) + "\n")
+        self.report({'INFO'}, "Activity log written to text datablock 'MCP_Activity_Log'")
+        return {'FINISHED'}
+
+# Operator to open the addon preferences (telemetry + API keys)
+class BLENDERMCP_OT_OpenPrefs(bpy.types.Operator):
+    bl_idname = "blendermcp.open_prefs"
+    bl_label = "Open BlenderMCP Preferences"
+    bl_description = "Open the BlenderMCP addon preferences (telemetry and API keys)"
+
+    def execute(self, context):
+        try:
+            bpy.ops.preferences.addon_show(module=__name__)
+        except Exception as e:
+            self.report({'ERROR'}, f"Could not open preferences: {str(e)}")
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
 # Registration functions
 def register():
     bpy.types.Scene.blendermcp_port = IntProperty(
@@ -2484,6 +4958,18 @@ def register():
     bpy.types.Scene.blendermcp_auto_start_server = bpy.props.BoolProperty(
         name="Auto-Start Server",
         description="Automatically start the MCP server when Blender loads",
+        default=True
+    )
+
+    bpy.types.Scene.blendermcp_paused = bpy.props.BoolProperty(
+        name="Pause MCP",
+        description="Pause execution of MCP commands (status commands still work)",
+        default=False
+    )
+
+    bpy.types.Scene.blendermcp_show_activity = bpy.props.BoolProperty(
+        name="Show Activity",
+        description="Show the recent MCP command activity log in the panel",
         default=True
     )
 
@@ -2602,6 +5088,10 @@ def register():
     bpy.utils.register_class(BLENDERMCP_OT_StartServer)
     bpy.utils.register_class(BLENDERMCP_OT_StopServer)
     bpy.utils.register_class(BLENDERMCP_OT_OpenTerms)
+    bpy.utils.register_class(BLENDERMCP_OT_DismissError)
+    bpy.utils.register_class(BLENDERMCP_OT_UndoLastAI)
+    bpy.utils.register_class(BLENDERMCP_OT_DumpLog)
+    bpy.utils.register_class(BLENDERMCP_OT_OpenPrefs)
 
     # Auto-start the server so the MCP client can connect without manual UI interaction
     scene = getattr(bpy.context, 'scene', None)
@@ -2634,11 +5124,17 @@ def unregister():
     bpy.utils.unregister_class(BLENDERMCP_OT_StartServer)
     bpy.utils.unregister_class(BLENDERMCP_OT_StopServer)
     bpy.utils.unregister_class(BLENDERMCP_OT_OpenTerms)
+    bpy.utils.unregister_class(BLENDERMCP_OT_DismissError)
+    bpy.utils.unregister_class(BLENDERMCP_OT_UndoLastAI)
+    bpy.utils.unregister_class(BLENDERMCP_OT_DumpLog)
+    bpy.utils.unregister_class(BLENDERMCP_OT_OpenPrefs)
     bpy.utils.unregister_class(BLENDERMCP_AddonPreferences)
 
     del bpy.types.Scene.blendermcp_port
     del bpy.types.Scene.blendermcp_server_running
     del bpy.types.Scene.blendermcp_auto_start_server
+    del bpy.types.Scene.blendermcp_paused
+    del bpy.types.Scene.blendermcp_show_activity
     del bpy.types.Scene.blendermcp_use_polyhaven
     del bpy.types.Scene.blendermcp_use_hyper3d
     del bpy.types.Scene.blendermcp_hyper3d_mode

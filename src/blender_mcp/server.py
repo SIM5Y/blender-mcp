@@ -5,9 +5,10 @@ import json
 import asyncio
 import logging
 import tempfile
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Dict, Any, List
+from typing import AsyncIterator, Dict, Any, List, Union
 import os
 from pathlib import Path
 import base64
@@ -31,7 +32,8 @@ class BlenderConnection:
     host: str
     port: int
     sock: socket.socket = None  # Changed from 'socket' to 'sock' to avoid naming conflict
-    
+    lock: threading.Lock = field(default_factory=threading.Lock)  # Serializes send_command calls
+
     def connect(self) -> bool:
         """Connect to the Blender addon socket server"""
         if self.sock:
@@ -114,59 +116,64 @@ class BlenderConnection:
             raise Exception("No data received")
 
     def send_command(self, command_type: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
-        """Send a command to Blender and return the response"""
-        if not self.sock and not self.connect():
-            raise ConnectionError("Not connected to Blender")
-        
-        command = {
-            "type": command_type,
-            "params": params or {}
-        }
-        
-        try:
-            # Log the command being sent
-            logger.info(f"Sending command: {command_type} with params: {params}")
-            
-            # Send the command
-            self.sock.sendall(json.dumps(command).encode('utf-8'))
-            logger.info(f"Command sent, waiting for response...")
-            
-            # Set a timeout for receiving - use the same timeout as in receive_full_response
-            self.sock.settimeout(180.0)  # Match the addon's timeout
-            
-            # Receive the response using the improved receive_full_response method
-            response_data = self.receive_full_response(self.sock)
-            logger.info(f"Received {len(response_data)} bytes of data")
-            
-            response = json.loads(response_data.decode('utf-8'))
-            logger.info(f"Response parsed, status: {response.get('status', 'unknown')}")
-            
-            if response.get("status") == "error":
-                logger.error(f"Blender error: {response.get('message')}")
-                raise Exception(response.get("message", "Unknown error from Blender"))
-            
-            return response.get("result", {})
-        except socket.timeout:
-            logger.error("Socket timeout while waiting for response from Blender")
-            # Don't try to reconnect here - let the get_blender_connection handle reconnection
-            # Just invalidate the current socket so it will be recreated next time
-            self.sock = None
-            raise Exception("Timeout waiting for Blender response - try simplifying your request")
-        except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
-            logger.error(f"Socket connection error: {str(e)}")
-            self.sock = None
-            raise Exception(f"Connection to Blender lost: {str(e)}")
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON response from Blender: {str(e)}")
-            # Try to log what was received
-            if 'response_data' in locals() and response_data:
-                logger.error(f"Raw response (first 200 bytes): {response_data[:200]}")
-            raise Exception(f"Invalid response from Blender: {str(e)}")
-        except Exception as e:
-            logger.error(f"Error communicating with Blender: {str(e)}")
-            # Don't try to reconnect here - let the get_blender_connection handle reconnection
-            self.sock = None
-            raise Exception(f"Communication error with Blender: {str(e)}")
+        """Send a command to Blender and return the response.
+
+        Thread-safe: the whole request/response exchange is serialized on
+        self.lock so concurrent tool calls cannot interleave on the socket.
+        """
+        with self.lock:
+            if not self.sock and not self.connect():
+                raise ConnectionError("Not connected to Blender")
+
+            command = {
+                "type": command_type,
+                "params": params or {}
+            }
+
+            try:
+                # Log the command being sent
+                logger.info(f"Sending command: {command_type} with params: {params}")
+
+                # Send the command
+                self.sock.sendall(json.dumps(command).encode('utf-8'))
+                logger.info(f"Command sent, waiting for response...")
+
+                # Set a timeout for receiving - use the same timeout as in receive_full_response
+                self.sock.settimeout(180.0)  # Match the addon's timeout
+
+                # Receive the response using the improved receive_full_response method
+                response_data = self.receive_full_response(self.sock)
+                logger.info(f"Received {len(response_data)} bytes of data")
+
+                response = json.loads(response_data.decode('utf-8'))
+                logger.info(f"Response parsed, status: {response.get('status', 'unknown')}")
+
+                if response.get("status") == "error":
+                    logger.error(f"Blender error: {response.get('message')}")
+                    raise Exception(response.get("message", "Unknown error from Blender"))
+
+                return response.get("result", {})
+            except socket.timeout:
+                logger.error("Socket timeout while waiting for response from Blender")
+                # Don't try to reconnect here - let the get_blender_connection handle reconnection
+                # Just invalidate the current socket so it will be recreated next time
+                self.sock = None
+                raise Exception("Timeout waiting for Blender response - try simplifying your request")
+            except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
+                logger.error(f"Socket connection error: {str(e)}")
+                self.sock = None
+                raise Exception(f"Connection to Blender lost: {str(e)}")
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON response from Blender: {str(e)}")
+                # Try to log what was received
+                if 'response_data' in locals() and response_data:
+                    logger.error(f"Raw response (first 200 bytes): {response_data[:200]}")
+                raise Exception(f"Invalid response from Blender: {str(e)}")
+            except Exception as e:
+                logger.error(f"Error communicating with Blender: {str(e)}")
+                # Don't try to reconnect here - let the get_blender_connection handle reconnection
+                self.sock = None
+                raise Exception(f"Communication error with Blender: {str(e)}")
 
 @asynccontextmanager
 async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
@@ -214,21 +221,65 @@ mcp = FastMCP(
 
 # Global connection for resources (since resources can't access context)
 _blender_connection = None
-_polyhaven_enabled = False  # Add this global variable
+
+# Addon version this server release is designed to pair with
+EXPECTED_ADDON_VERSION = "1.7.0"
+
+# Only warn once per server process about an outdated addon
+_addon_outdated_warned = False
+
+
+def _warn_addon_outdated(reason: str):
+    """Log (once) that the installed addon.py predates this server version"""
+    global _addon_outdated_warned
+    if not _addon_outdated_warned:
+        _addon_outdated_warned = True
+        logger.warning(
+            f"{reason} The installed addon.py is outdated - please update it to "
+            f"version {EXPECTED_ADDON_VERSION} in Blender for full functionality."
+        )
+
+
+def _check_addon_capabilities(connection):
+    """Query addon capabilities after connecting and warn on version skew.
+
+    Tolerates old addons that don't implement get_capabilities.
+    """
+    try:
+        capabilities = connection.send_command("get_capabilities")
+        addon_version = capabilities.get("addon_version", "unknown")
+        logger.info(f"Blender addon version: {addon_version}")
+        if addon_version != EXPECTED_ADDON_VERSION:
+            logger.warning(
+                f"Version skew detected: addon reports {addon_version} but this server "
+                f"expects {EXPECTED_ADDON_VERSION}. Please update addon.py in Blender."
+            )
+    except Exception as e:
+        if "Unknown command type" in str(e):
+            _warn_addon_outdated("Blender addon does not support get_capabilities.")
+        else:
+            logger.warning(f"Could not query addon capabilities: {str(e)}")
+
 
 def get_blender_connection():
     """Get or create a persistent Blender connection"""
-    global _blender_connection, _polyhaven_enabled  # Add _polyhaven_enabled to globals
-    
+    global _blender_connection
+
     # If we have an existing connection, check if it's still valid
     if _blender_connection is not None:
         try:
-            # First check if PolyHaven is enabled by sending a ping command
-            result = _blender_connection.send_command("get_polyhaven_status")
-            # Store the PolyHaven status globally
-            _polyhaven_enabled = result.get("enabled", False)
+            # Lightweight liveness check
+            _blender_connection.send_command("ping")
             return _blender_connection
         except Exception as e:
+            if "Unknown command type" in str(e):
+                # Old addon without ping support - fall back to the legacy liveness check
+                _warn_addon_outdated("Blender addon does not support ping.")
+                try:
+                    _blender_connection.send_command("get_polyhaven_status")
+                    return _blender_connection
+                except Exception as fallback_error:
+                    e = fallback_error
             # Connection is dead, close it and create a new one
             logger.warning(f"Existing connection is no longer valid: {str(e)}")
             try:
@@ -236,7 +287,7 @@ def get_blender_connection():
             except:
                 pass
             _blender_connection = None
-    
+
     # Create a new connection if needed
     if _blender_connection is None:
         host = os.getenv("BLENDER_HOST", DEFAULT_HOST)
@@ -247,17 +298,22 @@ def get_blender_connection():
             _blender_connection = None
             raise Exception("Could not connect to Blender. Make sure the Blender addon is running.")
         logger.info("Created new persistent connection to Blender")
-    
+        # Check addon capabilities / version skew on first successful connect
+        _check_addon_capabilities(_blender_connection)
+
     return _blender_connection
 
 
 @mcp.tool()
 @telemetry_tool("get_scene_info")
-def get_scene_info(ctx: Context, user_prompt: str) -> str:
+def get_scene_info(ctx: Context, user_prompt: str = "") -> str:
     """Get detailed information about the current Blender scene
 
+    Returns a quick summary capped at 20 objects - for full or filtered
+    listings use get_scene_graph.
+
     Parameters:
-    - user_prompt: The original user prompt that led to this tool call (required for telemetry)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
         blender = get_blender_connection()
@@ -290,7 +346,7 @@ def get_object_info(ctx: Context, object_name: str, user_prompt: str = "") -> st
         return f"Error getting object info: {str(e)}"
 
 @mcp.tool()
-def get_viewport_screenshot(ctx: Context, max_size: int = 1000, user_prompt: str = "") -> Image:
+def get_viewport_screenshot(ctx: Context, max_size: int = 800, user_prompt: str = "") -> Image:
     """
     Capture a screenshot of the current Blender 3D viewport.
 
@@ -307,29 +363,50 @@ def get_viewport_screenshot(ctx: Context, max_size: int = 1000, user_prompt: str
     
     try:
         blender = get_blender_connection()
-        
-        # Create temp file path
-        temp_dir = tempfile.gettempdir()
-        temp_path = os.path.join(temp_dir, f"blender_screenshot_{os.getpid()}.png")
-        
+
+        # 1.7+ addon: send no filepath so the addon writes to ITS OWN tempdir,
+        # returns the image base64-encoded, and deletes the file itself. This
+        # works when Blender runs on a remote host and leaks nothing there.
         result = blender.send_command("get_viewport_screenshot", {
             "max_size": max_size,
-            "filepath": temp_path,
             "format": "png"
         })
-        
-        if "error" in result:
-            raise Exception(result["error"])
-        
-        if not os.path.exists(temp_path):
-            raise Exception("Screenshot file was not created")
-        
-        # Read the file
-        with open(temp_path, 'rb') as f:
-            image_bytes = f.read()
-        
-        # Delete the temp file
-        os.remove(temp_path)
+
+        img_format = result.get("format", "png") if isinstance(result, dict) else "png"
+        if isinstance(result, dict) and result.get("image_data"):
+            image_bytes = base64.b64decode(result["image_data"])
+        else:
+            # Old addon: it needs an explicit filepath on a shared filesystem.
+            # Retry with a server-local temp path and read the file back.
+            temp_dir = tempfile.gettempdir()
+            temp_path = os.path.join(temp_dir, f"blender_screenshot_{os.getpid()}.png")
+
+            result = blender.send_command("get_viewport_screenshot", {
+                "max_size": max_size,
+                "filepath": temp_path,
+                "format": "png"
+            })
+
+            if isinstance(result, dict) and "error" in result:
+                raise Exception(result["error"])
+
+            img_format = result.get("format", "png") if isinstance(result, dict) else "png"
+            if isinstance(result, dict) and result.get("image_data"):
+                image_bytes = base64.b64decode(result["image_data"])
+                try:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                except OSError:
+                    pass
+            else:
+                if not os.path.exists(temp_path):
+                    raise Exception("Screenshot file was not created")
+
+                with open(temp_path, 'rb') as f:
+                    image_bytes = f.read()
+
+                # Delete the temp file
+                os.remove(temp_path)
         
         # Upload to storage for telemetry
         try:
@@ -340,7 +417,7 @@ def get_viewport_screenshot(ctx: Context, max_size: int = 1000, user_prompt: str
             pass  # Silently fail - don't break screenshot for telemetry issues
         
         success = True
-        return Image(data=image_bytes, format="png")
+        return Image(data=image_bytes, format=img_format)
         
     except Exception as e:
         error_msg = str(e)
@@ -371,22 +448,857 @@ def get_viewport_screenshot(ctx: Context, max_size: int = 1000, user_prompt: str
 
 @mcp.tool()
 @rich_telemetry_tool("execute_blender_code", capture_code=True)
-def execute_blender_code(ctx: Context, code: str, user_prompt: str = "") -> str:
+def execute_blender_code(
+    ctx: Context,
+    code: str,
+    rollback_on_error: bool = False,
+    reset_namespace: bool = False,
+    user_prompt: str = ""
+) -> str:
     """
-    Execute arbitrary Python code in Blender. Make sure to do it step-by-step by breaking it into smaller chunks.
+    Execute arbitrary Python code in Blender with REPL semantics. Make sure to do it
+    step-by-step by breaking it into smaller chunks.
+
+    The code runs in a PERSISTENT namespace (variables survive between calls),
+    pre-loaded with bpy, bmesh, mathutils, math, json, random, Vector, Matrix,
+    Euler, Quaternion. If the last statement is an expression, its repr() is
+    returned as result_repr - like a REPL, no print() needed for the final value.
 
     Parameters:
     - code: The Python code to execute
-    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    - rollback_on_error: If True and the code raises, the scene is automatically
+      restored to the state before this call (undo rollback)
+    - reset_namespace: If True, clear the persistent namespace before running
+
+    Returns JSON: {executed (bool - CHECK THIS, errors do not raise), stdout,
+    result_repr, error {type, message, traceback} | null, rolled_back,
+    scene_diff (objects/materials/collections added, removed, modified)}.
     """
     try:
         # Get the global connection
         blender = get_blender_connection()
-        result = blender.send_command("execute_code", {"code": code})
-        return f"Code executed successfully: {result.get('result', '')}"
+        result = blender.send_command("execute_code", {
+            "code": code,
+            "rollback_on_error": rollback_on_error,
+            "reset_namespace": reset_namespace,
+        })
+        return json.dumps(result, indent=2)
     except Exception as e:
         logger.error(f"Error executing code: {str(e)}")
         return f"Error executing code: {str(e)}"
+
+# Structured scene tools (addon >= 1.7.0)
+
+@mcp.tool()
+@telemetry_tool("get_scene_graph")
+def get_scene_graph(
+    ctx: Context,
+    filter_type: str = None,
+    name_contains: str = None,
+    collection: str = None,
+    offset: int = 0,
+    limit: int = 50,
+    include: List[str] = None,
+    user_prompt: str = ""
+) -> str:
+    """
+    Get a structured listing of the Blender scene: settings, collections and objects.
+
+    Prefer this over get_scene_info on real scenes - it supports filtering and
+    pagination so large scenes don't overflow the response.
+
+    Parameters:
+    - filter_type: Only objects of this type ('MESH', 'CAMERA', 'LIGHT', 'ARMATURE', 'EMPTY', 'CURVE', ...)
+    - name_contains: Case-insensitive substring filter on object names
+    - collection: Only objects inside this collection (recursive)
+    - offset / limit: Pagination over the filtered objects (default 0/50); the response
+      includes total_count so you know whether to page further
+    - include: Optional extras per object, list from: "bounds" (world_bounding_box,
+      meshes only), "modifiers", "mesh_stats" (vertex/polygon counts)
+
+    Returns JSON: scene settings (frame range, fps, current frame, mode, active/selected
+    objects, render engine), a flat collections list, and per-object name/type/parent/
+    collections, location/rotation_euler/scale (meters/radians), dimensions, visibility,
+    material slots and has_animation.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("get_scene_graph", {
+            "filter_type": filter_type,
+            "name_contains": name_contains,
+            "collection": collection,
+            "offset": offset,
+            "limit": limit,
+            "include": include
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting scene graph: {str(e)}")
+        return f"Error getting scene graph: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("set_transform")
+def set_transform(
+    ctx: Context,
+    name: str,
+    location: List[float] = None,
+    rotation_euler: List[float] = None,
+    scale: List[float] = None,
+    relative: bool = False,
+    user_prompt: str = ""
+) -> str:
+    """
+    Set or offset an object's location, rotation and/or scale in one call.
+
+    Prefer this over execute_blender_code for transform changes - it validates the
+    object and returns the resulting transform and bounding box for verification.
+
+    Parameters:
+    - name: Object name (see get_scene_graph)
+    - location: [x, y, z] in meters (omit to leave unchanged)
+    - rotation_euler: [x, y, z] in radians (omit to leave unchanged)
+    - scale: [x, y, z] scale factors (omit to leave unchanged)
+    - relative: If True, location/rotation are added and scale is multiplied
+      instead of replacing the current values
+
+    Returns JSON with the final location, rotation_euler, scale, dimensions and
+    world_bounding_box (meshes) - use it to confirm the object ended up as intended.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("set_transform", {
+            "name": name,
+            "location": location,
+            "rotation_euler": rotation_euler,
+            "scale": scale,
+            "relative": relative
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error setting transform: {str(e)}")
+        return f"Error setting transform: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("place_object")
+def place_object(
+    ctx: Context,
+    name: str,
+    mode: str = "ground",
+    target: str = None,
+    offset: List[float] = None,
+    margin: float = 0.0,
+    user_prompt: str = ""
+) -> str:
+    """
+    Place an object using common spatial rules - no manual bounding-box math needed.
+
+    Prefer this over hand-computing AABB positions in execute_blender_code.
+
+    Parameters:
+    - name: Object to move
+    - mode: "ground" (rest the object's bounding box on Z=0), "on_object" (stack it on
+      top of `target`, centered on the target's XY), or "offset" (translate by `offset`)
+    - target: Target object name (required for mode "on_object")
+    - offset: [x, y, z] in meters - the translation for "offset" mode, or an extra
+      nudge applied after "on_object" placement
+    - margin: Extra vertical gap in meters (default 0.0)
+
+    Returns JSON with the final location, rotation_euler, scale, dimensions and
+    world_bounding_box.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("place_object", {
+            "name": name,
+            "mode": mode,
+            "target": target,
+            "offset": offset,
+            "margin": margin
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error placing object: {str(e)}")
+        return f"Error placing object: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("manage_modifiers")
+def manage_modifiers(
+    ctx: Context,
+    name: str,
+    action: str,
+    modifier_type: str = None,
+    modifier_name: str = None,
+    params: Dict[str, Any] = None,
+    index: int = None,
+    user_prompt: str = ""
+) -> str:
+    """
+    List, add, configure, apply, remove or reorder modifiers on an object.
+
+    Prefer this over execute_blender_code for modifier work - it returns each
+    modifier's current settings so you can verify the stack.
+
+    Parameters:
+    - name: Object name
+    - action: "list" | "add" | "set_params" | "apply" | "remove" | "move"
+    - modifier_type: Blender modifier type for "add" (e.g. 'SUBSURF', 'BEVEL',
+      'ARRAY', 'MIRROR', 'SOLIDIFY', 'BOOLEAN', 'DECIMATE')
+    - modifier_name: Which modifier to target for set_params/apply/remove/move
+    - params: Dict of modifier RNA property names to values, applied on "add" or
+      "set_params", e.g. {"levels": 2}, {"width": 0.02, "segments": 3},
+      {"count": 5, "relative_offset_displace": [1.1, 0, 0]}. Unknown keys are
+      reported back, not fatal.
+    - index: New stack position for "move" (0 = top of stack)
+
+    Returns JSON: the object's modifier list [{name, type, show_viewport, params}]
+    after the change ("add" also reports the created modifier's name).
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("manage_modifiers", {
+            "name": name,
+            "action": action,
+            "modifier_type": modifier_type,
+            "modifier_name": modifier_name,
+            "params": params,
+            "index": index
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error managing modifiers: {str(e)}")
+        return f"Error managing modifiers: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("boolean_op")
+def boolean_op(
+    ctx: Context,
+    object_a: str,
+    object_b: str,
+    operation: str = "DIFFERENCE",
+    apply: bool = True,
+    delete_operand: bool = True,
+    solver: str = "EXACT",
+    user_prompt: str = ""
+) -> str:
+    """
+    Perform a boolean operation between two mesh objects (cut, merge or intersect).
+
+    Prefer this over execute_blender_code: it handles modifier setup, apply and cleanup.
+
+    Parameters:
+    - object_a: Mesh that receives the result
+    - object_b: Mesh used as the operand (e.g. the "cutter")
+    - operation: "DIFFERENCE" (cut B out of A), "UNION", or "INTERSECT"
+    - apply: Apply the modifier immediately (default True)
+    - delete_operand: Delete object_b afterwards (default True)
+    - solver: "EXACT" (robust, default) or "FAST"
+
+    Returns JSON with mesh_stats before/after (vertices, polygons) and the resulting
+    world_bounding_box - compare the stats to confirm the mesh actually changed.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("boolean_op", {
+            "object_a": object_a,
+            "object_b": object_b,
+            "operation": operation,
+            "apply": apply,
+            "delete_operand": delete_operand,
+            "solver": solver
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error performing boolean operation: {str(e)}")
+        return f"Error performing boolean operation: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("organize_scene")
+def organize_scene(
+    ctx: Context,
+    action: str,
+    name: str = None,
+    parent: str = None,
+    objects: List[str] = None,
+    collection: str = None,
+    child: str = None,
+    keep_transform: bool = True,
+    old: str = None,
+    new: str = None,
+    user_prompt: str = ""
+) -> str:
+    """
+    Organize the scene: collections, parenting, renaming and deleting objects.
+
+    Prefer this over execute_blender_code for scene housekeeping.
+
+    Parameters by action:
+    - action="create_collection": name, optional parent (collection) - returns the actual name created
+    - action="move_to_collection": objects (list of names), collection - unlinks them from other collections
+    - action="set_parent": child, parent (object names), keep_transform (keep world position, default True)
+    - action="clear_parent": child, keep_transform
+    - action="rename": old, new - returns the actual resulting name (Blender may append .001)
+    - action="delete": objects (list of names) - returns {deleted, not_found}
+
+    Returns JSON {action, ...action-specific fields..., ok: true}.
+    """
+    try:
+        blender = get_blender_connection()
+        params: Dict[str, Any] = {"action": action}
+        if name is not None:
+            params["name"] = name
+        if parent is not None:
+            params["parent"] = parent
+        if objects is not None:
+            params["objects"] = objects
+        if collection is not None:
+            params["collection"] = collection
+        if child is not None:
+            params["child"] = child
+        if old is not None:
+            params["old"] = old
+        if new is not None:
+            params["new"] = new
+        if action in ("set_parent", "clear_parent"):
+            params["keep_transform"] = keep_transform
+        result = blender.send_command("organize_scene", params)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error organizing scene: {str(e)}")
+        return f"Error organizing scene: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("manage_timeline")
+def manage_timeline(
+    ctx: Context,
+    action: str = "get",
+    frame_start: int = None,
+    frame_end: int = None,
+    fps: int = None,
+    frame_current: int = None,
+    user_prompt: str = ""
+) -> str:
+    """
+    Get or set the scene timeline: frame range, fps and current frame.
+
+    Call this FIRST when animating so keyframes land where you expect.
+    Time in seconds = frame / fps; frames are integers.
+
+    Parameters:
+    - action: "get" (default) or "set" (provide any of the values below)
+    - frame_start / frame_end: Timeline range in frames
+    - fps: Playback frame rate (e.g. 24, 30, 60)
+    - frame_current: Move the playhead to this frame
+
+    Returns JSON {frame_start, frame_end, fps, frame_current, duration_seconds}
+    reflecting the state after any changes were applied.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("manage_timeline", {
+            "action": action,
+            "frame_start": frame_start,
+            "frame_end": frame_end,
+            "fps": fps,
+            "frame_current": frame_current
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error managing timeline: {str(e)}")
+        return f"Error managing timeline: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("set_keyframes")
+def set_keyframes(
+    ctx: Context,
+    name: str,
+    data_path: str,
+    keys: List[Dict[str, Any]],
+    index: int = -1,
+    interpolation: str = None,
+    user_prompt: str = ""
+) -> str:
+    """
+    Insert keyframes on an object property - the main tool for animating.
+
+    Prefer this over execute_blender_code for keyframing: it handles fcurve creation,
+    vector channels and pose bones. Units: meters, radians, frames.
+
+    Parameters:
+    - name: Object name (use the armature object's name for pose-bone paths)
+    - data_path: Property to animate: "location", "rotation_euler", "scale",
+      "hide_viewport", or a pose-bone path like 'pose.bones["Bone"].rotation_euler'
+    - keys: List of {"frame": int, "value": float | [floats]}. A list value sets the
+      whole vector (e.g. {"frame": 1, "value": [0, 0, 1.5708]}); a single float
+      animates one channel selected by `index`.
+    - index: Channel for float values (0=X, 1=Y, 2=Z); -1 = all channels (default)
+    - interpolation: Optional interpolation for the created keys
+      ("CONSTANT", "LINEAR", "BEZIER")
+
+    Returns JSON with the object's fcurves (data_path, array_index, keyframe_count,
+    frame_range) and keys_created.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("set_keyframes", {
+            "name": name,
+            "data_path": data_path,
+            "keys": keys,
+            "index": index,
+            "interpolation": interpolation
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error setting keyframes: {str(e)}")
+        return f"Error setting keyframes: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("delete_keyframes")
+def delete_keyframes(
+    ctx: Context,
+    name: str,
+    data_path: str = None,
+    frames: List[int] = None,
+    user_prompt: str = ""
+) -> str:
+    """
+    Delete keyframes from an object's animation.
+
+    Use get_animation_info first to see which fcurves and frames exist.
+
+    Parameters:
+    - name: Object name
+    - data_path: Only remove keys on this property (e.g. "location");
+      None = all animated properties
+    - frames: List of frame numbers to remove; None = all frames (removing every
+      key on a curve deletes the fcurve, and the action if it becomes empty)
+
+    Returns JSON with counts of removed keyframes and fcurves.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("delete_keyframes", {
+            "name": name,
+            "data_path": data_path,
+            "frames": frames
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error deleting keyframes: {str(e)}")
+        return f"Error deleting keyframes: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("set_keyframe_interpolation")
+def set_keyframe_interpolation(
+    ctx: Context,
+    name: str,
+    data_path: str = None,
+    frames: List[int] = None,
+    interpolation: str = "BEZIER",
+    easing: str = "AUTO",
+    make_cyclic: bool = False,
+    user_prompt: str = ""
+) -> str:
+    """
+    Change interpolation/easing of existing keyframes; optionally make the motion loop.
+
+    Use after set_keyframes to control the feel: BEZIER for natural ease-in/out,
+    LINEAR for mechanical motion, CONSTANT for instant stepping.
+
+    Parameters:
+    - name: Object name
+    - data_path: Restrict to one property (e.g. "location"); None = all animated properties
+    - frames: Restrict to these frame numbers; None = all keyframes
+    - interpolation: "CONSTANT" | "LINEAR" | "BEZIER" | "SINE" | "QUAD" | "CUBIC" |
+      "BACK" | "BOUNCE" | "ELASTIC"
+    - easing: "AUTO" | "EASE_IN" | "EASE_OUT" | "EASE_IN_OUT"
+    - make_cyclic: Add a Cycles modifier to the fcurves so the animation repeats forever
+
+    Returns JSON with the number of keyframe points and fcurves modified.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("set_keyframe_interpolation", {
+            "name": name,
+            "data_path": data_path,
+            "frames": frames,
+            "interpolation": interpolation,
+            "easing": easing,
+            "make_cyclic": make_cyclic
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error setting keyframe interpolation: {str(e)}")
+        return f"Error setting keyframe interpolation: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("get_animation_info")
+def get_animation_info(
+    ctx: Context,
+    name: str = None,
+    user_prompt: str = ""
+) -> str:
+    """
+    Inspect animation data: a scene-wide overview or one object's keyframes in detail.
+
+    Use before delete_keyframes/set_keyframe_interpolation, and to verify what
+    set_keyframes created.
+
+    Parameters:
+    - name: Object name for a detailed view; omit for the scene overview
+
+    Without name, returns JSON: timeline settings, animated_objects
+    (name, action, fcurve_count, frame_range) and all action names.
+    With name, returns JSON: the object's action, fcurves with their keyframes
+    (frame, value, interpolation; up to 50 per curve), NLA tracks, shape keys
+    and constraints.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("get_animation_info", {"name": name})
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting animation info: {str(e)}")
+        return f"Error getting animation info: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("set_camera")
+def set_camera(
+    ctx: Context,
+    action: str,
+    camera: str = None,
+    object_names: List[str] = None,
+    preset: str = None,
+    focal_length: float = None,
+    ortho: bool = False,
+    margin: float = 1.2,
+    location: List[float] = None,
+    look_at: Union[List[float], str] = None,
+    user_prompt: str = ""
+) -> str:
+    """
+    Aim, position or create the scene camera ("MCP_Camera" is created if none exists).
+
+    Prefer this over execute_blender_code for camera setup - it computes framing
+    distances for you.
+
+    Parameters:
+    - action: "frame_objects" (fit objects in view), "preset" (view from a standard
+      direction, then frame), or "look_at" (place and aim manually)
+    - camera: Camera object name; default the scene camera (created if missing)
+    - object_names: Objects to frame; default all visible mesh objects
+    - preset: "front" | "right" | "top" | "isometric" | "three_quarter"
+    - focal_length: Lens in mm (e.g. 35, 50, 85)
+    - ortho: Use an orthographic camera
+    - margin: Framing headroom multiplier (default 1.2; higher = wider shot)
+    - location: [x, y, z] camera position in meters (for "look_at")
+    - look_at: [x, y, z] world-space point to aim at, or an object name
+      (aims at that object's bounding-box center) (for "look_at")
+
+    Returns JSON {camera, location, rotation_euler, focal_length, is_scene_camera}.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("set_camera", {
+            "action": action,
+            "camera": camera,
+            "object_names": object_names,
+            "preset": preset,
+            "focal_length": focal_length,
+            "ortho": ortho,
+            "margin": margin,
+            "location": location,
+            "look_at": look_at
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error setting camera: {str(e)}")
+        return f"Error setting camera: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("render_preview")
+def render_preview(
+    ctx: Context,
+    object_names: List[str] = None,
+    angles: List[str] = None,
+    max_size: int = 800,
+    shading: str = "SOLID",
+    user_prompt: str = ""
+) -> list:
+    """
+    Fast OpenGL renders of the scene from several standard angles at once.
+
+    Use this to visually verify your work after geometry, material or layout changes -
+    much faster than render_image, and it never touches user cameras or render settings.
+
+    Parameters:
+    - object_names: Objects to frame; default all visible mesh objects
+    - angles: List from "front", "right", "top", "isometric", "three_quarter"
+      (default ["front", "right", "top", "isometric"])
+    - max_size: Image size cap in pixels (default 800)
+    - shading: "SOLID" (fast, default) or "MATERIAL" (shows materials/textures)
+
+    Returns a text summary of the angle order followed by one image per angle.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("render_preview", {
+            "object_names": object_names,
+            "angles": angles,
+            "max_size": max_size,
+            "shading": shading
+        })
+        if "error" in result:
+            raise Exception(result["error"])
+        images = result.get("images", [])
+        if not images:
+            raise Exception("No preview images were returned")
+        angle_order = ", ".join(str(img.get("angle", "?")) for img in images)
+        content: list = [f"Preview renders, angles in order: {angle_order}"]
+        for img in images:
+            content.append(Image(
+                data=base64.b64decode(img["image_data"]),
+                format=img.get("format", "png")
+            ))
+        return content
+    except Exception as e:
+        logger.error(f"Error rendering preview: {str(e)}")
+        raise Exception(f"Preview render failed: {str(e)}")
+
+@mcp.tool()
+@telemetry_tool("render_animation_preview")
+def render_animation_preview(
+    ctx: Context,
+    frame_start: int = None,
+    frame_end: int = None,
+    num_frames: int = 6,
+    max_size: int = 512,
+    camera: str = None,
+    user_prompt: str = ""
+) -> list:
+    """
+    Render a few frames spread across the animation to check motion at a glance.
+
+    Use this to visually verify animations after keyframing - much cheaper than a
+    full render. Requires a scene camera: call set_camera first if there is none.
+
+    Parameters:
+    - frame_start / frame_end: Frame range to sample; default the scene timeline
+    - num_frames: Frames to render, evenly spaced, first and last always included
+      (default 6, max 10)
+    - max_size: Image size cap in pixels (default 512)
+    - camera: Camera object name; default the scene camera
+
+    Returns a text summary of the sampled frame numbers followed by one image per frame.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("render_animation_preview", {
+            "frame_start": frame_start,
+            "frame_end": frame_end,
+            "num_frames": num_frames,
+            "max_size": max_size,
+            "camera": camera
+        })
+        if "error" in result:
+            raise Exception(result["error"])
+        images = result.get("images", [])
+        if not images:
+            raise Exception("No animation preview images were returned")
+        frames_sampled = result.get("frames_sampled") or [img.get("frame", "?") for img in images]
+        frame_order = ", ".join(str(f) for f in frames_sampled)
+        content: list = [f"Animation preview, frames in order: {frame_order}"]
+        for img in images:
+            content.append(Image(
+                data=base64.b64decode(img["image_data"]),
+                format=img.get("format", "png")
+            ))
+        return content
+    except Exception as e:
+        logger.error(f"Error rendering animation preview: {str(e)}")
+        raise Exception(f"Animation preview render failed: {str(e)}")
+
+@mcp.tool()
+@telemetry_tool("render_image")
+def render_image(
+    ctx: Context,
+    camera: str = None,
+    resolution_x: int = 960,
+    resolution_y: int = 540,
+    samples: int = None,
+    engine: str = None,
+    format: str = "PNG",
+    user_prompt: str = ""
+) -> Image:
+    """
+    Full-quality render of the current frame through the scene camera.
+
+    Use this to visually verify final results. For quick checks prefer render_preview -
+    a full render can be slow, so keep resolution and samples modest to stay under the
+    180-second command timeout.
+
+    Parameters:
+    - camera: Camera object name; default the scene camera (call set_camera if none)
+    - resolution_x / resolution_y: Output size in pixels (default 960x540)
+    - samples: Render samples; lower is faster (e.g. 32-128)
+    - engine: "CYCLES" (quality) or "EEVEE" (speed); default the scene's current engine
+    - format: "PNG" or "JPEG"
+
+    Returns the rendered image. All render settings are restored afterwards.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("render_image", {
+            "camera": camera,
+            "resolution_x": resolution_x,
+            "resolution_y": resolution_y,
+            "samples": samples,
+            "engine": engine,
+            "format": format
+        })
+        if "error" in result:
+            raise Exception(result["error"])
+        if not result.get("image_data"):
+            raise Exception("No image data was returned")
+        return Image(
+            data=base64.b64decode(result["image_data"]),
+            format=result.get("format", "png")
+        )
+    except Exception as e:
+        logger.error(f"Error rendering image: {str(e)}")
+        raise Exception(f"Render failed: {str(e)}")
+
+@mcp.tool()
+@telemetry_tool("export_scene")
+def export_scene(
+    ctx: Context,
+    filepath: str,
+    format: str = None,
+    selected_objects: List[str] = None,
+    apply_modifiers: bool = True,
+    export_animations: bool = True,
+    user_prompt: str = ""
+) -> str:
+    """
+    Export the scene (or specific objects) to a 3D file on disk.
+
+    Supported: .glb/.gltf, .fbx, .obj, .usd/.usdc/.usda. Prefer this over
+    execute_blender_code - it handles selection and per-format options.
+
+    Parameters:
+    - filepath: Absolute output path; parent directories are created automatically.
+      The extension determines the format unless `format` is given.
+    - format: Optional explicit format override (e.g. "glb", "fbx", "obj", "usd")
+    - selected_objects: Export only these objects (list of names); default whole scene
+    - apply_modifiers: Bake modifiers into the exported meshes (default True)
+    - export_animations: Include animations where the format supports it (default True)
+
+    Returns JSON {filepath, format, size_bytes, objects_exported}.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("export_scene", {
+            "filepath": filepath,
+            "format": format,
+            "selected_objects": selected_objects,
+            "apply_modifiers": apply_modifiers,
+            "export_animations": export_animations
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error exporting scene: {str(e)}")
+        return f"Error exporting scene: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("import_local_asset")
+def import_local_asset(
+    ctx: Context,
+    filepath: str,
+    target_size: float = None,
+    collection: str = None,
+    user_prompt: str = ""
+) -> str:
+    """
+    Import a local 3D file into the scene.
+
+    Supported: .glb/.gltf, .fbx, .obj, .usd/.usdc/.usda, .blend (appends all objects).
+    Prefer this over execute_blender_code - it tracks what was added and can
+    normalize the size.
+
+    Parameters:
+    - filepath: Absolute path of the file to import
+    - target_size: Uniformly scale the import so its largest dimension equals this
+      many meters (e.g. 1.0 for a chair, 4.5 for a car)
+    - collection: Move the imported objects into this collection
+
+    Returns JSON {imported_objects, dimensions, world_bounding_box} - check the
+    bounding box, then use place_object/set_transform to position the asset.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("import_local_asset", {
+            "filepath": filepath,
+            "target_size": target_size,
+            "collection": collection
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error importing local asset: {str(e)}")
+        return f"Error importing local asset: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("manage_project")
+def manage_project(
+    ctx: Context,
+    action: str,
+    filepath: str = None,
+    user_prompt: str = ""
+) -> str:
+    """
+    Save, version, open or reset the .blend project file.
+
+    Save a version snapshot before large destructive changes so work can be recovered.
+
+    Parameters:
+    - action: "save" (current file; provide filepath if never saved),
+      "save_as" (requires filepath),
+      "save_version" (writes <dir>/versions/<name>_v###.blend next to a saved file),
+      "open" (requires filepath), or
+      "new" (fresh default scene - unsaved work is lost)
+    - filepath: Absolute .blend path where the action requires one
+
+    Returns JSON {action, filepath, ok: true}.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("manage_project", {
+            "action": action,
+            "filepath": filepath
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error managing project: {str(e)}")
+        return f"Error managing project: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("undo_last_operation")
+def undo_last_operation(ctx: Context, user_prompt: str = "") -> str:
+    """
+    Undo the most recent operation in Blender (one step back on the undo stack).
+
+    Use this to recover when a tool call or executed code left the scene in a bad
+    state. Every mutating MCP command pushes an undo checkpoint, so one call usually
+    reverts exactly the last command. Verify with get_scene_graph or render_preview
+    afterwards.
+
+    Returns JSON {undone: true} on success.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("undo_last")
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error undoing last operation: {str(e)}")
+        return f"Error undoing last operation: {str(e)}"
 
 @mcp.tool()
 @telemetry_tool("get_polyhaven_categories")
@@ -400,8 +1312,6 @@ def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris", user_promp
     """
     try:
         blender = get_blender_connection()
-        if not _polyhaven_enabled:
-            return "PolyHaven integration is disabled. Select it in the sidebar in BlenderMCP, then run it again."
         result = blender.send_command("get_polyhaven_categories", {"asset_type": asset_type})
         
         if "error" in result:
@@ -835,6 +1745,16 @@ def download_sketchfab_model(
         logger.error(traceback.format_exc())
         return f"Error downloading Sketchfab model: {str(e)}"
 
+def _is_valid_http_url(url) -> bool:
+    """Return True if url is an absolute http(s) URL with a host"""
+    if not isinstance(url, str):
+        return False
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+
 def _process_bbox(original_bbox: list[float] | list[int] | None) -> list[int] | None:
     if original_bbox is None:
         return None
@@ -914,8 +1834,8 @@ def generate_hyper3d_model_via_images(
                     (Path(path).suffix, base64.b64encode(f.read()).decode("ascii"))
                 )
     elif input_image_urls is not None:
-        if not all(urlparse(i) for i in input_image_paths):
-            return "Error: not all image URLs are valid!"
+        if not all(_is_valid_http_url(i) for i in input_image_urls):
+            return "Error: not all image URLs are valid! URLs must be absolute http:// or https:// URLs."
         images = input_image_urls.copy()
     try:
         blender = get_blender_connection()
@@ -1130,12 +2050,30 @@ def asset_creation_strategy() -> str:
     """Defines the preferred strategy for creating assets in Blender"""
     return """When creating 3D content in Blender, always start by checking if integrations are available:
 
-    0. Before anything, always check the scene from get_scene_info()
-    
+    0. Before anything, always check the scene first: use get_scene_graph() on real scenes
+       (it supports filtering and pagination); get_scene_info() is only a quick summary
+       for tiny scenes.
+
+    **IMPORTANT: Prefer structured tools over execute_blender_code**
+    - Move/rotate/scale: set_transform(); placement (on ground, stacking on another
+      object): place_object(). Never hand-write bounding-box math in Python.
+    - Modifiers: manage_modifiers(); boolean cuts/merges: boolean_op()
+    - Collections, parenting, rename, delete: organize_scene()
+    - Cameras and renders: set_camera(), render_preview(), render_image()
+    - Files: import_local_asset(), export_scene(), manage_project()
+    - Animation: manage_timeline(), set_keyframes(), etc. (see the animation_strategy prompt)
+    Only use execute_blender_code for things no structured tool covers
+    (custom mesh generation, materials/node trees, lights, physics, etc.)
+
     **IMPORTANT: Visual Verification**
     - Use get_viewport_screenshot() BEFORE making changes to see the current state
-    - Use get_viewport_screenshot() AFTER executing code or importing assets to verify the result
+    - Use render_preview() AFTER geometry, material or layout changes - it renders from
+      several standard angles at once and is the best way to verify the result
     - This helps confirm your changes worked as expected and catch any visual issues
+
+    **Recovering from mistakes**
+    - undo_last_operation() reverts the last mutating MCP command
+    - execute_blender_code(..., rollback_on_error=True) automatically undoes a script that raised
     1. First use the following tools to verify if the following integrations are enabled:
         1. PolyHaven
             Use get_polyhaven_status() to verify its status
@@ -1204,7 +2142,9 @@ def asset_creation_strategy() -> str:
     3. Always check the world_bounding_box for each item so that:
         - Ensure that all objects that should not be clipping are not clipping.
         - Items have right spatial relationship.
-    
+        - Fix positions with place_object() (ground/stacking) and set_transform() -
+          do not hand-write AABB math in execute_blender_code.
+
     4. Recommended asset source priority:
         - For specific existing objects: First try Sketchfab, then PolyHaven
         - For generic objects/furniture: First try PolyHaven, then Sketchfab
@@ -1220,10 +2160,45 @@ def asset_creation_strategy() -> str:
     - The task specifically requires a basic material/color
 
     **Best Practices:**
-    - Always take a screenshot after completing a task to verify the visual result
-    - Always call get_scene_info() after completing a task to verify the changes worked
-    - When executing multiple operations, take intermediate screenshots to confirm each step
-    - If something looks wrong in the screenshot or scene info, investigate and fix before proceeding
+    - Always verify visually after completing a task: render_preview() (multiple angles)
+      or get_viewport_screenshot()
+    - Always call get_scene_graph() after completing a task to verify the changes worked
+    - When executing multiple operations, verify intermediate steps visually to confirm each one
+    - If something looks wrong in the render or scene graph, investigate and fix before
+      proceeding - undo_last_operation() can revert a bad step
+    """
+
+@mcp.prompt()
+def animation_strategy() -> str:
+    """Defines the preferred workflow for animating in Blender"""
+    return """When animating in Blender, follow this workflow:
+
+    1. Timeline first: call manage_timeline() to check or set fps, frame_start and
+       frame_end BEFORE placing any keyframes, so frames land where you expect.
+       Time in seconds = frame / fps (e.g. at 24 fps, frame 48 is the 2-second mark).
+
+    2. Block the motion: use set_keyframes() to key poses at sparse frames - start,
+       key poses, end. Don't keyframe every frame; Blender interpolates between keys.
+       Use data_path "location" / "rotation_euler" (radians) / "scale", or pose-bone
+       paths like 'pose.bones["Bone"].rotation_euler' for armatures.
+
+    3. Refine the feel: use set_keyframe_interpolation() for easing - BEZIER for
+       natural motion, LINEAR for mechanical motion, CONSTANT for stepping.
+       For seamless loops (spinning, bobbing), use make_cyclic=True.
+
+    4. Verify visually: render_animation_preview() renders a handful of frames across
+       the range so you can check the motion. Use get_animation_info() to inspect
+       fcurves and keyframes when something looks off; delete_keyframes() removes bad keys.
+
+    5. Camera moves: set up the shot with set_camera() (frame_objects / preset /
+       look_at), then animate the camera object itself with set_keyframes() on its
+       "location" and "rotation_euler".
+
+    6. Final output: render_image() for a full-quality still of the current frame.
+
+    Performance note: every command must finish within 180 seconds. Keep renders small
+    (low resolution/samples) and prefer render_preview / render_animation_preview over
+    full renders while iterating.
     """
 
 # Main execution
