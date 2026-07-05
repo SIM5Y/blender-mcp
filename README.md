@@ -293,6 +293,7 @@ Once the config file has been set on Claude, and the addon is running on Blender
 - Apply or create materials for objects
 - Execute any Python code in Blender, with scene diffs and optional rollback on error
 - Export scenes (glTF/FBX/OBJ/USD), import local assets, and save/version projects
+- One-click Save Version and Render (still/clip with platform presets) from the panel; optional auto-version when an AI session ends
 - Download the right models, assets and HDRIs through [Poly Haven](https://polyhaven.com/)
 - AI generated 3D models through [Hyper3D Rodin](https://hyper3d.ai/)
 - Built-in update checker: the addon panel shows an "Update available" notice when a newer version is published on GitHub, with a manual "Check for Updates" button; the automatic once-per-session startup check can be toggled via the "Check for updates on startup" addon preference

@@ -403,6 +403,53 @@ def main():
     check("manage_project save_as",
           r.get("ok") is True and os.path.exists(blend_path), str(r)[:300])
 
+    # --- v1.8.1 panel output controls (save/version/render operators) ------
+    # Operators register under RNA names derived from bl_idname:
+    # 'blendermcp.save_now' -> bpy.types.BLENDERMCP_OT_save_now
+    for op_name in ("save_now", "save_version", "render_still",
+                    "render_clip", "cancel_render", "open_render_folder"):
+        check(f"operator registered blendermcp.{op_name}",
+              hasattr(bpy.types, f"BLENDERMCP_OT_{op_name}"), "not in bpy.types")
+
+    prop = bpy.context.scene.bl_rna.properties.get("blendermcp_render_preset")
+    items = {i.identifier for i in prop.enum_items} if prop is not None else set()
+    check("render preset scene prop",
+          prop is not None
+          and items == {"SCENE", "LINKEDIN_WIDE", "SQUARE", "VERTICAL"},
+          f"prop={prop} items={items}")
+
+    check("auto_version pref declared",
+          "auto_version_on_session_end" in
+          getattr(mod.BLENDERMCP_AddonPreferences, "__annotations__", {}),
+          str(list(getattr(mod.BLENDERMCP_AddonPreferences,
+                           "__annotations__", {}).keys())))
+
+    # Shared version-snapshot helper: writes v-numbered copies next to the
+    # .blend saved above (the panel operator and the session-end auto-version
+    # hook both end in this exact function)
+    vpath = mod._save_version_snapshot()
+    check("_save_version_snapshot v001",
+          vpath.endswith("smoke_test_v001.blend") and os.path.exists(vpath),
+          vpath)
+    vpath2 = mod._save_version_snapshot()
+    check("_save_version_snapshot increments",
+          vpath2.endswith("smoke_test_v002.blend") and os.path.exists(vpath2),
+          vpath2)
+
+    # The manage_project handler routes through the same helper
+    r = run("manage_project", action="save_version")
+    check("manage_project save_version via helper",
+          str(r.get("filepath", "")).endswith("smoke_test_v003.blend")
+          and os.path.exists(str(r.get("filepath", ""))), str(r)[:300])
+
+    # Session-end hook: must never raise, from any thread, with any stats
+    # (the scheduled timer no-ops here: the module is not an installed addon,
+    # so the preferences lookup returns None)
+    server._maybe_auto_version({"commands": 3, "mutated": True})
+    server._maybe_auto_version({"commands": 0, "mutated": False})
+    server._maybe_auto_version({})
+    check("_maybe_auto_version no crash", True, "")
+
     # --- assignment continuity (part 2: sidecar after save + handoff) ------
     sidecar_path = os.path.join(tmpdir, "smoke_test.assignment.md")
     sidecar_content = ""

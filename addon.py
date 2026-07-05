@@ -27,14 +27,14 @@ from contextlib import redirect_stdout, suppress
 bl_info = {
     "name": "Blender MCP",
     "author": "BlenderMCP",
-    "version": (1, 8, 0),
+    "version": (1, 8, 1),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > BlenderMCP",
     "description": "Connect Blender to Claude via MCP",
     "category": "Interface",
 }
 
-ADDON_VERSION = "1.8.0"
+ADDON_VERSION = "1.8.1"
 
 RODIN_FREE_TRIAL_KEY = "vibecoding"
 
@@ -188,14 +188,21 @@ _RENDER_JOB = {
 _RENDER_JOB_RESTORE = {}
 _RENDER_HANDLERS_ADDED = False
 
+# Last output written by a panel render (or a finished async clip render);
+# shown in the panel's Output box with an "open folder" button.
+_LAST_RENDER_PATH = None
+
 
 def _finish_render_job(done=False, cancelled=False):
     """Mark the async VSE render job finished and restore render settings."""
+    global _LAST_RENDER_PATH
     if not _RENDER_JOB.get("active"):
         return
     _RENDER_JOB["active"] = False
     _RENDER_JOB["done"] = bool(done)
     _RENDER_JOB["cancelled"] = bool(cancelled)
+    if done and _RENDER_JOB.get("filepath"):
+        _LAST_RENDER_PATH = _RENDER_JOB["filepath"]
     snap = dict(_RENDER_JOB_RESTORE)
     _RENDER_JOB_RESTORE.clear()
     if snap:
@@ -231,6 +238,54 @@ def _ensure_render_handlers():
     bpy.app.handlers.render_complete.append(_mcp_vse_render_complete)
     bpy.app.handlers.render_cancel.append(_mcp_vse_render_cancel)
     _RENDER_HANDLERS_ADDED = True
+
+def _save_version_snapshot():
+    """Write the next numbered version copy to <blend_dir>/versions.
+
+    Shared by the manage_project 'save_version' handler, the panel's
+    Save Version operator, and the session-end auto-version hook.
+    Returns the written filepath; raises ValueError when the project
+    has never been saved.
+    """
+    current = bpy.data.filepath
+    if not current:
+        raise ValueError(
+            "The project has never been saved. Save the .blend first "
+            "(Save Project in the panel, or manage_project action 'save_as')."
+        )
+    stem = os.path.splitext(os.path.basename(current))[0]
+    versions_dir = os.path.join(os.path.dirname(current), "versions")
+    os.makedirs(versions_dir, exist_ok=True)
+    pattern = re.compile(re.escape(stem) + r"_v(\d+)\.blend$", re.IGNORECASE)
+    highest = 0
+    for fname in os.listdir(versions_dir):
+        match = pattern.match(fname)
+        if match:
+            highest = max(highest, int(match.group(1)))
+    version_path = os.path.join(versions_dir, f"{stem}_v{highest + 1:03d}.blend")
+    try:
+        bpy.ops.wm.save_as_mainfile(filepath=version_path, copy=True)
+    except Exception as e:
+        raise Exception(f"Version save failed: {str(e)}")
+    return version_path
+
+
+def _panel_render_dir():
+    """Output folder for panel renders: <blend_dir>/render, or temp if unsaved."""
+    if bpy.data.filepath:
+        out_dir = os.path.join(os.path.dirname(bpy.data.filepath), "render")
+    else:
+        out_dir = os.path.join(tempfile.gettempdir(), "blendermcp_render")
+    os.makedirs(out_dir, exist_ok=True)
+    return out_dir
+
+
+def _panel_render_stem():
+    """Filename stem for panel renders (blend file name, or 'untitled')."""
+    if bpy.data.filepath:
+        return os.path.splitext(os.path.basename(bpy.data.filepath))[0]
+    return "untitled"
+
 
 # Persistent namespace for execute_code REPL semantics (lazily initialized)
 _EXEC_NAMESPACE = None
@@ -526,6 +581,8 @@ class BlenderMCPServer:
         print("Client handler started")
         client.settimeout(None)  # No timeout
         buffer = b''
+        # Per-connection session stats (read on disconnect for auto-versioning)
+        conn_stats = {"commands": 0, "mutated": False}
 
         try:
             while self.running:
@@ -552,8 +609,10 @@ class BlenderMCPServer:
 
                             # Push an undo checkpoint before mutating commands
                             # (skipped while paused - the command will be rejected anyway)
+                            conn_stats["commands"] += 1
                             if cmd_type in MUTATING_COMMANDS and \
                                     not getattr(bpy.context.scene, "blendermcp_paused", False):
+                                conn_stats["mutated"] = True
                                 try:
                                     bpy.ops.ed.undo_push(message=f"MCP: {cmd_type}")
                                 except Exception as undo_err:
@@ -613,7 +672,49 @@ class BlenderMCPServer:
                 self.client_connected = False
                 self.client_address = None
                 self._redraw_ui()
+            # Session ended: optionally snapshot a version of the work
+            self._maybe_auto_version(conn_stats)
             print("Client handler stopped")
+
+    def _maybe_auto_version(self, conn_stats):
+        """Auto-save a version snapshot when an AI session ends.
+
+        Runs on the socket thread, so the actual save is scheduled on
+        Blender's main thread via bpy.app.timers. Only fires when the
+        session executed at least one command AND at least one mutating
+        command ran; the preference and saved-file checks happen on the
+        main thread. Never raises.
+        """
+        try:
+            if not conn_stats.get("commands") or not conn_stats.get("mutated"):
+                return
+
+            def _auto_version():
+                try:
+                    addon_entry = bpy.context.preferences.addons.get(__name__)
+                    prefs = addon_entry.preferences if addon_entry else None
+                    if prefs is None or \
+                            not getattr(prefs, "auto_version_on_session_end", True):
+                        return None
+                    if not bpy.data.filepath:
+                        return None
+                    path = _save_version_snapshot()
+                    self.activity_log.append({
+                        "time": time.strftime("%H:%M:%S"),
+                        "type": "auto_version",
+                        "status": "ok",
+                        "duration_ms": 0,
+                        "summary": f"auto version saved: {path}"[:120],
+                    })
+                    print(f"BlenderMCP: auto version saved: {path}")
+                    self._redraw_ui()
+                except Exception as e:
+                    print(f"BlenderMCP: auto version failed: {str(e)}")
+                return None
+
+            bpy.app.timers.register(_auto_version, first_interval=0.0)
+        except Exception:
+            pass
 
     def _log_activity(self, cmd_type, command, response, start_time):
         """Record a command execution in the activity log (read by the UI panel)"""
@@ -2924,25 +3025,7 @@ class BlenderMCPServer:
             return {"action": action, "filepath": bpy.data.filepath, "ok": True}
 
         if action == "save_version":
-            current = bpy.data.filepath
-            if not current:
-                raise ValueError(
-                    "save_version requires a saved project. Use action 'save_as' first."
-                )
-            stem = os.path.splitext(os.path.basename(current))[0]
-            versions_dir = os.path.join(os.path.dirname(current), "versions")
-            os.makedirs(versions_dir, exist_ok=True)
-            pattern = re.compile(re.escape(stem) + r"_v(\d+)\.blend$", re.IGNORECASE)
-            highest = 0
-            for fname in os.listdir(versions_dir):
-                match = pattern.match(fname)
-                if match:
-                    highest = max(highest, int(match.group(1)))
-            version_path = os.path.join(versions_dir, f"{stem}_v{highest + 1:03d}.blend")
-            try:
-                bpy.ops.wm.save_as_mainfile(filepath=version_path, copy=True)
-            except Exception as e:
-                raise Exception(f"Version save failed: {str(e)}")
+            version_path = _save_version_snapshot()
             return {"action": action, "filepath": version_path, "ok": True}
 
         if action == "open":
@@ -3714,6 +3797,41 @@ class BlenderMCPServer:
         return snap
 
     @staticmethod
+    def _apply_ffmpeg_output_settings(container="MPEG4", video_bitrate=None):
+        """Configure FFMPEG video output (container/codec/rate/sequencer).
+
+        Shared by the render_sequence handler and the panel's Render Clip
+        operator. Caller is responsible for snapshotting/restoring settings.
+        """
+        render = bpy.context.scene.render
+        if hasattr(render.image_settings, "media_type"):
+            render.image_settings.media_type = 'VIDEO'  # 5.x gates FFMPEG on this
+        render.image_settings.file_format = 'FFMPEG'
+        ff = render.ffmpeg
+        ff.format = container
+        if container == "WEBM":
+            codecs, audio_codecs = ("WEBM", "VP9", "AV1"), ("OPUS", "VORBIS")
+        else:
+            codecs, audio_codecs = ("H264",), ("AAC",)
+        for codec in codecs:
+            with suppress(Exception):
+                ff.codec = codec
+                break
+        for audio_codec in audio_codecs:
+            with suppress(Exception):
+                ff.audio_codec = audio_codec
+                break
+        if video_bitrate is not None:
+            with suppress(Exception):
+                ff.constant_rate_factor = 'NONE'
+            ff.video_bitrate = int(video_bitrate)
+        else:
+            with suppress(Exception):
+                ff.constant_rate_factor = 'HIGH'
+        if hasattr(render, "use_sequencer"):
+            render.use_sequencer = True
+
+    @staticmethod
     def _restore_vse_render_settings(snap):
         """Restore settings captured by _snapshot_vse_render_settings (best effort)"""
         scene = bpy.context.scene
@@ -3792,32 +3910,7 @@ class BlenderMCPServer:
                 scene.frame_start = int(frame_start)
             if frame_end is not None:
                 scene.frame_end = int(frame_end)
-            if hasattr(render.image_settings, "media_type"):
-                render.image_settings.media_type = 'VIDEO'  # 5.x gates FFMPEG on this
-            render.image_settings.file_format = 'FFMPEG'
-            ff = render.ffmpeg
-            ff.format = container
-            if container == "WEBM":
-                codecs, audio_codecs = ("WEBM", "VP9", "AV1"), ("OPUS", "VORBIS")
-            else:
-                codecs, audio_codecs = ("H264",), ("AAC",)
-            for codec in codecs:
-                with suppress(Exception):
-                    ff.codec = codec
-                    break
-            for audio_codec in audio_codecs:
-                with suppress(Exception):
-                    ff.audio_codec = audio_codec
-                    break
-            if video_bitrate is not None:
-                with suppress(Exception):
-                    ff.constant_rate_factor = 'NONE'
-                ff.video_bitrate = int(video_bitrate)
-            else:
-                with suppress(Exception):
-                    ff.constant_rate_factor = 'HIGH'
-            if hasattr(render, "use_sequencer"):
-                render.use_sequencer = True
+            self._apply_ffmpeg_output_settings(container, video_bitrate)
             render.filepath = filepath
 
             frames = scene.frame_end - scene.frame_start + 1
@@ -5847,6 +5940,12 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
         description="Check GitHub for a newer BlenderMCP version once per Blender session (a few seconds after startup)",
         default=True
     )
+    auto_version_on_session_end: BoolProperty(
+        name="Auto-save version when an AI session ends",
+        description="When an MCP client disconnects after modifying a saved .blend, "
+                    "automatically write a numbered snapshot to the versions folder",
+        default=True
+    )
     hyper3d_api_key: bpy.props.StringProperty(
         name="Hyper3D API Key",
         subtype="PASSWORD",
@@ -5937,6 +6036,14 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
         box.separator()
         row = box.row()
         row.operator("blendermcp.open_terms", text="View Terms and Conditions", icon='TEXT')
+
+        # Sessions section
+        layout.separator()
+        layout.label(text="Sessions:", icon='FILE_BLEND')
+        box = layout.box()
+        box.prop(self, "auto_version_on_session_end")
+        box.label(text="Snapshots go to the 'versions' folder next to the saved .blend",
+                  icon='INFO')
 
         # Updates section
         layout.separator()
@@ -6057,6 +6164,30 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
                 box.operator("blendermcp.dump_log", text="Copy Log to Text Editor", icon='TEXT')
             else:
                 box.label(text="No activity yet", icon='INFO')
+
+        # --- Output box (human-facing save / version / render controls) ---
+        box = layout.box()
+        box.label(text="Output", icon='OUTPUT')
+        row = box.row(align=True)
+        row.operator("blendermcp.save_now", text="Save", icon='FILE_TICK')
+        row.operator("blendermcp.save_version", text="Save Version", icon='DUPLICATE')
+        row = box.row(align=True)
+        row.prop(scene, "blendermcp_render_preset", text="")
+        row.operator("blendermcp.render_clip", text="Render Clip", icon='RENDER_ANIMATION')
+        row.operator("blendermcp.render_still", text="Render Still", icon='RENDER_STILL')
+        if _RENDER_JOB.get("active"):
+            row = box.row()
+            cur = _RENDER_JOB.get("frame_current")
+            end = _RENDER_JOB.get("frame_end")
+            row.label(text=f"Rendering frame {cur} / {end}", icon='RENDER_ANIMATION')
+            row.operator("blendermcp.cancel_render", text="Cancel", icon='X')
+        elif _LAST_RENDER_PATH:
+            row = box.row()
+            shown = _LAST_RENDER_PATH
+            if len(shown) > 48:
+                shown = "..." + shown[-45:]
+            row.label(text=shown, icon='CHECKMARK')
+            row.operator("blendermcp.open_render_folder", text="", icon='FILE_FOLDER')
 
         # --- Integrations box (keys come from addon preferences) ---
         box = layout.box()
@@ -6290,6 +6421,184 @@ class BLENDERMCP_OT_OpenPrefs(bpy.types.Operator):
             return {'CANCELLED'}
         return {'FINISHED'}
 
+# --- Output box operators: human-facing save/version/render controls ------
+
+# Operator to save the project (opens Save As for never-saved files)
+class BLENDERMCP_OT_SaveNow(bpy.types.Operator):
+    bl_idname = "blendermcp.save_now"
+    bl_label = "Save Project"
+    bl_description = "Save the .blend file (opens the Save As dialog if the file has never been saved)"
+
+    def execute(self, context):
+        had_path = bool(bpy.data.filepath)
+        try:
+            result = bpy.ops.wm.save_mainfile('INVOKE_DEFAULT')
+        except Exception as e:
+            self.report({'ERROR'}, f"Save failed: {str(e)}")
+            return {'CANCELLED'}
+        if 'FINISHED' in result and bpy.data.filepath:
+            self.report({'INFO'}, f"Saved: {bpy.data.filepath}")
+        elif not had_path:
+            # Unsaved file: the Save As file browser is now open
+            self.report({'INFO'}, "Choose a location in the Save As dialog")
+        return {'FINISHED'}
+
+# Operator to write a numbered version snapshot next to the saved .blend
+class BLENDERMCP_OT_SaveVersion(bpy.types.Operator):
+    bl_idname = "blendermcp.save_version"
+    bl_label = "Save Version Snapshot"
+    bl_description = "Write the next numbered snapshot copy to the versions folder next to the .blend (the working file stays open)"
+
+    @classmethod
+    def poll(cls, context):
+        return bool(bpy.data.filepath)
+
+    def execute(self, context):
+        try:
+            path = _save_version_snapshot()
+        except Exception as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Version saved: {path}")
+        return {'FINISHED'}
+
+# Operator to render the current frame through the scene camera
+class BLENDERMCP_OT_RenderStill(bpy.types.Operator):
+    bl_idname = "blendermcp.render_still"
+    bl_label = "Render Still"
+    bl_description = "Render the current frame through the scene camera (current render settings) to the render folder next to the .blend"
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene.camera is not None and not _RENDER_JOB.get("active")
+
+    def execute(self, context):
+        global _LAST_RENDER_PATH
+        scene = context.scene
+        out_path = os.path.join(
+            _panel_render_dir(),
+            f"{_panel_render_stem()}_f{scene.frame_current}.png",
+        )
+        snap = BlenderMCPServer._snapshot_render_settings()
+        try:
+            scene.render.image_settings.file_format = 'PNG'
+            scene.render.filepath = out_path
+            bpy.ops.render.render(write_still=True)
+        except Exception as e:
+            self.report({'ERROR'}, f"Render failed: {str(e)}")
+            return {'CANCELLED'}
+        finally:
+            BlenderMCPServer._restore_render_settings(snap)
+        if not os.path.exists(out_path):
+            self.report({'ERROR'}, f"Render finished but no file was written to {out_path}")
+            return {'CANCELLED'}
+        _LAST_RENDER_PATH = out_path
+        self.report({'INFO'}, f"Rendered: {out_path}")
+        return {'FINISHED'}
+
+# Operator to render the full animation to an MP4 (async, tracked in the panel)
+class BLENDERMCP_OT_RenderClip(bpy.types.Operator):
+    bl_idname = "blendermcp.render_clip"
+    bl_label = "Render Clip"
+    bl_description = "Render the full animation to an MP4 in the render folder next to the .blend (runs in the background; progress shows in this panel)"
+
+    @classmethod
+    def poll(cls, context):
+        return not _RENDER_JOB.get("active") and not bpy.app.background
+
+    def execute(self, context):
+        scene = context.scene
+        preset = getattr(scene, "blendermcp_render_preset", "SCENE")
+        filepath = os.path.join(
+            _panel_render_dir(),
+            f"{_panel_render_stem()}_{preset}.mp4",
+        )
+        snap = BlenderMCPServer._snapshot_vse_render_settings()
+        try:
+            if preset != "SCENE":
+                res, fps_val = BlenderMCPServer._resolve_delivery(preset=preset)
+                BlenderMCPServer._apply_delivery(res, fps_val)
+            BlenderMCPServer._apply_ffmpeg_output_settings("MPEG4")
+            scene.render.filepath = filepath
+        except Exception as e:
+            BlenderMCPServer._restore_vse_render_settings(snap)
+            self.report({'ERROR'}, f"Could not set up the render: {str(e)}")
+            return {'CANCELLED'}
+
+        _ensure_render_handlers()
+        _RENDER_JOB.update({
+            "active": True,
+            "frame_current": scene.frame_start,
+            "frame_end": scene.frame_end,
+            "filepath": filepath,
+            "done": False,
+            "cancelled": False,
+            "error": None,
+            "started_at": time.time(),
+        })
+        _RENDER_JOB_RESTORE.clear()
+        _RENDER_JOB_RESTORE.update(snap)
+        try:
+            bpy.ops.render.render('INVOKE_DEFAULT', animation=True)
+        except Exception as e:
+            _RENDER_JOB["active"] = False
+            _RENDER_JOB["error"] = str(e)
+            _RENDER_JOB_RESTORE.clear()
+            BlenderMCPServer._restore_vse_render_settings(snap)
+            self.report({'ERROR'}, f"Render failed to start: {str(e)}")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Rendering clip to {filepath}")
+        return {'FINISHED'}
+
+# Operator to cancel an active clip render (as far as the render API allows)
+class BLENDERMCP_OT_CancelRender(bpy.types.Operator):
+    bl_idname = "blendermcp.cancel_render"
+    bl_label = "Cancel Render"
+    bl_description = "Cancel the active clip render. Blender's Python API cannot abort a render mid-frame - press Esc in the render window to stop it"
+
+    @classmethod
+    def poll(cls, context):
+        return bool(_RENDER_JOB.get("active"))
+
+    def execute(self, context):
+        # There is no Python API to abort a running render job: the render
+        # window's Esc key is the only hard stop. Cleanup (settings restore,
+        # job state) happens in the render_cancel handler when it fires.
+        self.report(
+            {'WARNING'},
+            "Rendering can't be stopped from a script mid-frame - press Esc "
+            "in the render window to cancel."
+        )
+        return {'FINISHED'}
+
+# Operator to open the folder containing the last panel render output
+class BLENDERMCP_OT_OpenRenderFolder(bpy.types.Operator):
+    bl_idname = "blendermcp.open_render_folder"
+    bl_label = "Open Render Folder"
+    bl_description = "Open the folder containing the last rendered output"
+
+    @classmethod
+    def poll(cls, context):
+        return bool(_LAST_RENDER_PATH)
+
+    def execute(self, context):
+        folder = os.path.dirname(_LAST_RENDER_PATH or "")
+        if not folder or not os.path.isdir(folder):
+            self.report({'ERROR'}, f"Folder not found: {folder}")
+            return {'CANCELLED'}
+        try:
+            if hasattr(os, "startfile"):  # Windows
+                os.startfile(folder)
+            else:
+                import subprocess
+                import sys as _sys
+                opener = "open" if _sys.platform == "darwin" else "xdg-open"
+                subprocess.Popen([opener, folder])
+        except Exception as e:
+            self.report({'ERROR'}, f"Could not open folder: {str(e)}")
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
 # Registration functions
 def register():
     bpy.types.Scene.blendermcp_port = IntProperty(
@@ -6321,6 +6630,18 @@ def register():
         name="Show Activity",
         description="Show the recent MCP command activity log in the panel",
         default=True
+    )
+
+    bpy.types.Scene.blendermcp_render_preset = bpy.props.EnumProperty(
+        name="Delivery Preset",
+        description="Output preset for the panel's Render Clip button",
+        items=[
+            ("SCENE", "Scene settings", "Keep the scene's current resolution and frame rate"),
+            ("LINKEDIN_WIDE", "LinkedIn 16:9", "1920x1080 @ 25 fps"),
+            ("SQUARE", "Square 1:1", "1080x1080 @ 25 fps"),
+            ("VERTICAL", "Vertical 9:16", "1080x1920 @ 25 fps"),
+        ],
+        default="SCENE"
     )
 
     bpy.types.Scene.blendermcp_use_polyhaven = bpy.props.BoolProperty(
@@ -6444,6 +6765,12 @@ def register():
     bpy.utils.register_class(BLENDERMCP_OT_OpenPrefs)
     bpy.utils.register_class(BLENDERMCP_OT_CheckUpdates)
     bpy.utils.register_class(BLENDERMCP_OT_OpenUpdatePage)
+    bpy.utils.register_class(BLENDERMCP_OT_SaveNow)
+    bpy.utils.register_class(BLENDERMCP_OT_SaveVersion)
+    bpy.utils.register_class(BLENDERMCP_OT_RenderStill)
+    bpy.utils.register_class(BLENDERMCP_OT_RenderClip)
+    bpy.utils.register_class(BLENDERMCP_OT_CancelRender)
+    bpy.utils.register_class(BLENDERMCP_OT_OpenRenderFolder)
 
     # Keep the .assignment.md sidecar current on every save (plain Ctrl+S too).
     # Guard against double-append on addon reload: the function object changes
@@ -6522,6 +6849,12 @@ def unregister():
     bpy.utils.unregister_class(BLENDERMCP_OT_OpenPrefs)
     bpy.utils.unregister_class(BLENDERMCP_OT_CheckUpdates)
     bpy.utils.unregister_class(BLENDERMCP_OT_OpenUpdatePage)
+    bpy.utils.unregister_class(BLENDERMCP_OT_SaveNow)
+    bpy.utils.unregister_class(BLENDERMCP_OT_SaveVersion)
+    bpy.utils.unregister_class(BLENDERMCP_OT_RenderStill)
+    bpy.utils.unregister_class(BLENDERMCP_OT_RenderClip)
+    bpy.utils.unregister_class(BLENDERMCP_OT_CancelRender)
+    bpy.utils.unregister_class(BLENDERMCP_OT_OpenRenderFolder)
     bpy.utils.unregister_class(BLENDERMCP_AddonPreferences)
 
     del bpy.types.Scene.blendermcp_port
@@ -6529,6 +6862,7 @@ def unregister():
     del bpy.types.Scene.blendermcp_auto_start_server
     del bpy.types.Scene.blendermcp_paused
     del bpy.types.Scene.blendermcp_show_activity
+    del bpy.types.Scene.blendermcp_render_preset
     del bpy.types.Scene.blendermcp_use_polyhaven
     del bpy.types.Scene.blendermcp_use_hyper3d
     del bpy.types.Scene.blendermcp_hyper3d_mode
