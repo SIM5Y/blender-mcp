@@ -278,6 +278,10 @@ Once the config file has been set on Claude, and the addon is running on Blender
 - Download the right models, assets and HDRIs through [Poly Haven](https://polyhaven.com/)
 - AI generated 3D models through [Hyper3D Rodin](https://hyper3d.ai/)
 
+##### Assignment continuity & token awareness
+
+Each build/edit job can keep a persistent assignment record (title, plan checklist, decisions, progress log, handoff notes) stored inside the .blend and mirrored to a human-readable `<name>.assignment.md` sidecar next to the saved file. A fresh agent in a new chat reads the record and gets up to speed for a fraction of the tokens. The server also tracks approximate token usage of tool output per session and proactively suggests "Save & Continue in a new chat" before the chat's token allowance is stressed.
+
 
 ### Example Commands
 

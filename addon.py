@@ -97,6 +97,98 @@ def _init_exec_namespace():
         "Quaternion": Quaternion,
     }
 
+# ---------------------------------------------------------------------------
+# Assignment continuity: a persistent per-project assignment record stored in
+# the .blend (Text datablock) and mirrored to a human-readable markdown
+# sidecar next to saved files so a fresh agent can resume cheaply.
+# ---------------------------------------------------------------------------
+ASSIGNMENT_TEXT_NAME = "MCP_Assignment"
+
+def _assignment_load():
+    """Load the assignment record from the MCP_Assignment text datablock (or None)."""
+    text = bpy.data.texts.get(ASSIGNMENT_TEXT_NAME)
+    if text is None:
+        return None
+    try:
+        record = json.loads(text.as_string())
+        return record if isinstance(record, dict) else None
+    except Exception:
+        return None
+
+def _assignment_markdown(record):
+    """Render the assignment record as human-readable markdown."""
+    lines = [f"# {record.get('title', 'Untitled assignment')}", ""]
+    brief = record.get("brief")
+    if brief:
+        lines += [str(brief), ""]
+    tokens_k = int(record.get("token_estimate", 0) or 0) // 1000
+    lines += [
+        "## Status",
+        f"{record.get('status', 'active')} — updated {record.get('updated', '?')} — ~{tokens_k}k tokens",
+        "",
+        "## Plan",
+    ]
+    for entry in record.get("plan", []):
+        mark = "x" if entry.get("done") else " "
+        lines.append(f"- [{mark}] {entry.get('step', '')}")
+    lines.append("")
+    if record.get("decisions"):
+        lines.append("## Decisions & Conventions")
+        lines += [f"- {d}" for d in record["decisions"]]
+        lines.append("")
+    if record.get("log"):
+        lines.append("## Log")
+        lines += [f"- {entry}" for entry in record["log"]]
+        lines.append("")
+    if record.get("handoff"):
+        lines += ["## Handoff", str(record["handoff"]), ""]
+    return "\n".join(lines)
+
+def _assignment_sidecar_path():
+    """Path of the markdown sidecar next to the saved .blend, or None if unsaved."""
+    if not bpy.data.filepath:
+        return None
+    stem = os.path.splitext(os.path.basename(bpy.data.filepath))[0]
+    return os.path.join(os.path.dirname(bpy.data.filepath), f"{stem}.assignment.md")
+
+def _assignment_store(record):
+    """Write the record to the text datablock and mirror the markdown sidecar.
+
+    Never raises into the command path: sidecar file I/O failures are reported
+    via the returned (sidecar_path, sidecar_error) tuple instead.
+    """
+    text = bpy.data.texts.get(ASSIGNMENT_TEXT_NAME)
+    if text is None:
+        text = bpy.data.texts.new(ASSIGNMENT_TEXT_NAME)
+    text.clear()
+    text.write(json.dumps(record, indent=2))
+    sidecar_path = _assignment_sidecar_path()
+    if not sidecar_path:
+        return None, None
+    try:
+        with open(sidecar_path, "w", encoding="utf-8") as f:
+            f.write(_assignment_markdown(record))
+        return sidecar_path, None
+    except Exception as e:
+        return None, f"Could not write sidecar: {str(e)}"
+
+@bpy.app.handlers.persistent
+def _blendermcp_save_post(_dummy=None):
+    """Refresh the .assignment.md sidecar whenever the .blend is saved (Ctrl+S too)."""
+    try:
+        record = _assignment_load()
+        if not record:
+            return
+        server = getattr(bpy.types, "blendermcp_server", None)
+        if server is not None:
+            try:
+                record["token_estimate"] = server._assignment_tokens(record)
+            except Exception:
+                pass
+        _assignment_store(record)
+    except Exception as e:
+        print(f"BlenderMCP: assignment sidecar refresh failed: {str(e)}")
+
 def get_credential(context, pref_name, scene_prop_name):
     """Read an API credential.
 
@@ -143,6 +235,11 @@ class BlenderMCPServer:
         self.commands_executed = 0
         self.executing = False
         self.activity_log = collections.deque(maxlen=50)
+        # Session token awareness: bytes sent over the socket (est. tokens = bytes/4)
+        self.bytes_sent = 0
+        # Assignment token accounting (see manage_assignment / _assignment_tokens)
+        self._assignment_token_base = None
+        self._assignment_prior_tokens = 0
 
     def _get_hyper3d_api_key(self):
         return get_credential(bpy.context, 'hyper3d_api_key', 'blendermcp_hyper3d_api_key')
@@ -309,7 +406,9 @@ class BlenderMCPServer:
                                 response = self.execute_command(command)
                                 response_json = json.dumps(response)
                                 try:
-                                    client.sendall(response_json.encode('utf-8'))
+                                    payload = response_json.encode('utf-8')
+                                    client.sendall(payload)
+                                    self.bytes_sent += len(payload)
                                 except:
                                     print("Failed to send response - client disconnected")
                             except Exception as e:
@@ -320,7 +419,9 @@ class BlenderMCPServer:
                                     "message": str(e)
                                 }
                                 try:
-                                    client.sendall(json.dumps(response).encode('utf-8'))
+                                    payload = json.dumps(response).encode('utf-8')
+                                    client.sendall(payload)
+                                    self.bytes_sent += len(payload)
                                 except:
                                     pass
                             finally:
@@ -462,6 +563,7 @@ class BlenderMCPServer:
             "export_scene": self.export_scene,
             "import_local_asset": self.import_local_asset,
             "manage_project": self.manage_project,
+            "manage_assignment": self.manage_assignment,
             # Integration status
             "get_polyhaven_status": self.get_polyhaven_status,
             "get_hyper3d_status": self.get_hyper3d_status,
@@ -2686,6 +2788,129 @@ class BlenderMCPServer:
             raise Exception(f"New file failed: {str(e)}")
         return {"action": action, "filepath": None, "ok": True}
 
+    def _assignment_tokens(self, record):
+        """Cumulative token estimate for the assignment (prior sessions + this one).
+
+        On the first touch of an existing record this session, the record's
+        stored token_estimate becomes the prior-session baseline; from then on
+        this session's contribution is bytes_sent/4 since that moment.
+        """
+        session_tokens = self.bytes_sent // 4
+        if self._assignment_token_base is None:
+            self._assignment_token_base = session_tokens
+            self._assignment_prior_tokens = \
+                int((record or {}).get("token_estimate", 0) or 0)
+        return self._assignment_prior_tokens + \
+            max(session_tokens - self._assignment_token_base, 0)
+
+    def manage_assignment(self, action, title=None, brief=None, plan=None,
+                          step=None, done=True, decision=None, note=None,
+                          handoff=None):
+        """Persistent assignment record for session continuity.
+
+        Canonical storage: the MCP_Assignment text datablock (JSON, travels
+        inside the .blend). Mirror: <blend_stem>.assignment.md next to saved
+        files (also refreshed by the save_post handler on every save).
+        """
+        action = str(action).lower()
+        valid_actions = ("start", "update", "read", "handoff")
+        if action not in valid_actions:
+            raise ValueError(
+                f"Unknown action '{action}'. Use one of: {', '.join(valid_actions)}."
+            )
+
+        # LLMs sometimes send the plan as a JSON-encoded string - tolerate it.
+        if isinstance(plan, str):
+            try:
+                parsed = json.loads(plan)
+                plan = parsed if isinstance(parsed, list) else [plan]
+            except Exception:
+                plan = [plan]
+        if plan is not None and not isinstance(plan, list):
+            raise ValueError("plan must be a list of step strings.")
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        record = _assignment_load()
+
+        if action == "read":
+            if not record:
+                return {"exists": False}
+            record["token_estimate"] = self._assignment_tokens(record)
+            result = dict(record)
+            result["exists"] = True
+            result["markdown"] = _assignment_markdown(record)
+            result["sidecar_path"] = _assignment_sidecar_path()
+            return result
+
+        if action == "start":
+            if not title:
+                raise ValueError(
+                    "action 'start' requires a title. Provide a short assignment "
+                    "title and a plan (list of step strings)."
+                )
+            # Fresh assignment: attribute this whole session's traffic to it
+            self._assignment_prior_tokens = 0
+            self._assignment_token_base = 0
+            record = {
+                "version": 1,
+                "title": str(title),
+                "brief": str(brief) if brief else "",
+                "created": now,
+                "updated": now,
+                "status": "active",
+                "plan": [{"step": str(s), "done": False} for s in (plan or [])],
+                "decisions": [],
+                "log": [],
+                "handoff": None,
+                "token_estimate": 0,
+            }
+        else:
+            # update / handoff need an existing record
+            if not record:
+                raise ValueError(
+                    "No assignment record exists. Use manage_assignment "
+                    "action 'start' first (or 'read' to check)."
+                )
+            if action == "update":
+                if step is not None:
+                    needle = str(step).lower()
+                    match = next(
+                        (p for p in record.get("plan", [])
+                         if needle in str(p.get("step", "")).lower()), None)
+                    if match is None:
+                        existing = ", ".join(
+                            str(p.get("step")) for p in record.get("plan", [])
+                        ) or "(no steps)"
+                        raise ValueError(
+                            f"No plan step matches '{step}'. Existing steps: {existing}"
+                        )
+                    match["done"] = bool(done)
+                if decision is not None:
+                    record.setdefault("decisions", []).append(str(decision))
+                if note is not None:
+                    record.setdefault("log", []).append(f"[{now}] {str(note)}")
+                    record["log"] = record["log"][-100:]
+                if plan:
+                    record.setdefault("plan", []).extend(
+                        {"step": str(s), "done": False} for s in plan)
+            elif action == "handoff":
+                if not handoff:
+                    raise ValueError(
+                        "action 'handoff' requires handoff text "
+                        "(final summary + next steps)."
+                    )
+                record["handoff"] = str(handoff)
+                record["status"] = "complete"
+
+        record["updated"] = now
+        record["token_estimate"] = self._assignment_tokens(record)
+        sidecar_path, sidecar_error = _assignment_store(record)
+        result = dict(record)
+        result["sidecar_path"] = sidecar_path
+        if sidecar_error:
+            result["sidecar_error"] = sidecar_error
+        return result
+
     def get_polyhaven_categories(self, asset_type):
         """Get categories for a specific asset type from Polyhaven"""
         disabled = self._integration_disabled_error("blendermcp_use_polyhaven", "PolyHaven")
@@ -4781,6 +5006,7 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
                 if server.last_command_time:
                     age = f" ({int(time.time() - server.last_command_time)}s ago)"
                 box.label(text=f"Commands: {server.commands_executed} · Last: {last}{age}", icon='INFO')
+                box.label(text=f"Session: {server.commands_executed} cmds · ~{server.bytes_sent // 4 // 1000}k tok", icon='TIME')
             if server.last_error:
                 row = box.row()
                 row.alert = True
@@ -5185,6 +5411,14 @@ def register():
     bpy.utils.register_class(BLENDERMCP_OT_DumpLog)
     bpy.utils.register_class(BLENDERMCP_OT_OpenPrefs)
 
+    # Keep the .assignment.md sidecar current on every save (plain Ctrl+S too).
+    # Guard against double-append on addon reload: the function object changes
+    # between loads, so match by name before appending.
+    for h in list(bpy.app.handlers.save_post):
+        if getattr(h, "__name__", "") == "_blendermcp_save_post":
+            bpy.app.handlers.save_post.remove(h)
+    bpy.app.handlers.save_post.append(_blendermcp_save_post)
+
     # Auto-start the server so the MCP client can connect without manual UI interaction
     scene = getattr(bpy.context, 'scene', None)
     if scene is not None:
@@ -5210,6 +5444,12 @@ def unregister():
     if hasattr(bpy.types, "blendermcp_server") and bpy.types.blendermcp_server:
         bpy.types.blendermcp_server.stop()
         del bpy.types.blendermcp_server
+
+    # Remove the assignment sidecar save handler (match by name - the function
+    # object may belong to an earlier load of the addon module)
+    for h in list(bpy.app.handlers.save_post):
+        if getattr(h, "__name__", "") == "_blendermcp_save_post":
+            bpy.app.handlers.save_post.remove(h)
 
     bpy.utils.unregister_class(BLENDERMCP_PT_Panel)
     bpy.utils.unregister_class(BLENDERMCP_OT_SetFreeTrialHyper3DAPIKey)

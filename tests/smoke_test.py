@@ -331,6 +331,32 @@ def main():
           r.get("image_data") and r.get("width") == 128 and r.get("height") == 128,
           str({k: v for k, v in r.items() if k != 'image_data'})[:300])
 
+    # --- assignment continuity (part 1: before the file is saved) ----------
+    r = run("manage_assignment", action="read")
+    check("assignment read empty", r.get("exists") is False, str(r)[:200])
+
+    r = run("manage_assignment", action="start", title="Smoke Assignment",
+            brief="Exercise the assignment continuity record.",
+            plan=["Model the hero cube", "Light the scene"])
+    check("assignment start",
+          r.get("status") == "active" and len(r.get("plan", [])) >= 2
+          and r.get("title") == "Smoke Assignment",
+          str(r)[:300])
+
+    r = run("manage_assignment", action="update", step="hero cube", done=True,
+            decision="Units are meters", note="Marked first step done")
+    check("assignment update",
+          any(p.get("done") for p in r.get("plan", []))
+          and "Units are meters" in r.get("decisions", [])
+          and any("Marked first step done" in entry for entry in r.get("log", [])),
+          str(r)[:400])
+
+    r = run("manage_assignment", action="read")
+    md = r.get("markdown", "")
+    check("assignment read markdown",
+          "Smoke Assignment" in md and "- [x]" in md and "- [ ]" in md,
+          md[:300])
+
     # --- pipeline ---------------------------------------------------------
     glb_path = os.path.join(tmpdir, "smoke.glb")
     r = run("export_scene", filepath=glb_path)
@@ -346,6 +372,25 @@ def main():
     r = run("manage_project", action="save_as", filepath=blend_path)
     check("manage_project save_as",
           r.get("ok") is True and os.path.exists(blend_path), str(r)[:300])
+
+    # --- assignment continuity (part 2: sidecar after save + handoff) ------
+    sidecar_path = os.path.join(tmpdir, "smoke_test.assignment.md")
+    sidecar_content = ""
+    if os.path.exists(sidecar_path):
+        with open(sidecar_path, encoding="utf-8") as f:
+            sidecar_content = f.read()
+    check("assignment sidecar after save",
+          "Smoke Assignment" in sidecar_content and "- [x]" in sidecar_content,
+          f"path={sidecar_path} exists={os.path.exists(sidecar_path)} "
+          f"content={sidecar_content[:200]}")
+
+    r = run("manage_assignment", action="handoff",
+            handoff="Hero cube modeled; next: lighting pass.")
+    check("assignment handoff",
+          r.get("status") == "complete"
+          and "lighting pass" in str(r.get("handoff", ""))
+          and r.get("sidecar_path"),
+          str(r)[:300])
 
     # --- pause switch --------------------------------------------------------
     bpy.context.scene.blendermcp_paused = True

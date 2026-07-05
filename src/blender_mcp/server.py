@@ -28,6 +28,52 @@ logger = logging.getLogger("BlenderMCPServer")
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 9876
 
+# ---------------------------------------------------------------------------
+# Session token awareness: approximate token burn of this chat's tool output.
+# est_tokens ~= response bytes / 4, plus (width*height)/750 per returned image.
+# ---------------------------------------------------------------------------
+_SESSION_STATS = {"tool_calls": 0, "est_tokens": 0, "last_advisory_at": 0}
+
+# Advisory thresholds: first at 50k est. tokens, then every additional 30k
+_ADVISORY_FIRST = 50_000
+_ADVISORY_STEP = 30_000
+
+
+def _note_image_tokens(width, height):
+    """Add the approximate token cost of a returned image to the session stats."""
+    try:
+        if width and height:
+            _SESSION_STATS["est_tokens"] += (int(width) * int(height)) // 750
+    except (TypeError, ValueError):
+        pass
+
+
+def _pending_advisory():
+    """Return the Save & Continue advisory once per crossed token threshold, else None."""
+    est = _SESSION_STATS["est_tokens"]
+    if est < _ADVISORY_FIRST:
+        return None
+    threshold = _ADVISORY_FIRST + ((est - _ADVISORY_FIRST) // _ADVISORY_STEP) * _ADVISORY_STEP
+    if threshold <= _SESSION_STATS.get("last_advisory_at", 0):
+        return None
+    _SESSION_STATS["last_advisory_at"] = threshold
+    return (
+        f"[Session advisory for the user: this chat has consumed roughly "
+        f"~{est // 1000}k tokens of tool output. To conserve the chat's token "
+        f"allowance, consider Save & Continue: save the project (manage_project), "
+        f"write a handoff (manage_assignment action='handoff'), then continue in "
+        f"a NEW chat — the next agent reads the assignment file and scene "
+        f"directly for a fraction of the tokens.]"
+    )
+
+
+def _with_advisory(text: str) -> str:
+    """Append the session advisory to a tool's text response at threshold crossings."""
+    advisory = _pending_advisory()
+    if advisory:
+        return f"{text}\n\n---\n{advisory}"
+    return text
+
 @dataclass
 class BlenderConnection:
     host: str
@@ -145,6 +191,10 @@ class BlenderConnection:
                 # Receive the response using the improved receive_full_response method
                 response_data = self.receive_full_response(self.sock)
                 logger.info(f"Received {len(response_data)} bytes of data")
+
+                # Session token awareness (inside the lock, so counts stay consistent)
+                _SESSION_STATS["tool_calls"] += 1
+                _SESSION_STATS["est_tokens"] += max(len(response_data) // 4, 1)
 
                 response = json.loads(response_data.decode('utf-8'))
                 logger.info(f"Response parsed, status: {response.get('status', 'unknown')}")
@@ -321,7 +371,7 @@ def get_scene_info(ctx: Context, user_prompt: str = "") -> str:
         result = blender.send_command("get_scene_info")
 
         # Just return the JSON representation of what Blender sent us
-        return json.dumps(result, indent=2)
+        return _with_advisory(json.dumps(result, indent=2))
     except Exception as e:
         logger.error(f"Error getting scene info from Blender: {str(e)}")
         return f"Error getting scene info: {str(e)}"
@@ -339,9 +389,9 @@ def get_object_info(ctx: Context, object_name: str, user_prompt: str = "") -> st
     try:
         blender = get_blender_connection()
         result = blender.send_command("get_object_info", {"name": object_name})
-        
+
         # Just return the JSON representation of what Blender sent us
-        return json.dumps(result, indent=2)
+        return _with_advisory(json.dumps(result, indent=2))
     except Exception as e:
         logger.error(f"Error getting object info from Blender: {str(e)}")
         return f"Error getting object info: {str(e)}"
@@ -417,6 +467,9 @@ def get_viewport_screenshot(ctx: Context, max_size: int = 800, user_prompt: str 
         except Exception:
             pass  # Silently fail - don't break screenshot for telemetry issues
         
+        if isinstance(result, dict):
+            _note_image_tokens(result.get("width"), result.get("height"))
+
         success = True
         return Image(data=image_bytes, format=img_format)
         
@@ -483,7 +536,7 @@ def execute_blender_code(
             "rollback_on_error": rollback_on_error,
             "reset_namespace": reset_namespace,
         })
-        return json.dumps(result, indent=2)
+        return _with_advisory(json.dumps(result, indent=2))
     except Exception as e:
         logger.error(f"Error executing code: {str(e)}")
         return f"Error executing code: {str(e)}"
@@ -532,7 +585,7 @@ def get_scene_graph(
             "limit": limit,
             "include": include
         })
-        return json.dumps(result, indent=2)
+        return _with_advisory(json.dumps(result, indent=2))
     except Exception as e:
         logger.error(f"Error getting scene graph: {str(e)}")
         return f"Error getting scene graph: {str(e)}"
@@ -956,7 +1009,7 @@ def get_animation_info(
     try:
         blender = get_blender_connection()
         result = blender.send_command("get_animation_info", {"name": name})
-        return json.dumps(result, indent=2)
+        return _with_advisory(json.dumps(result, indent=2))
     except Exception as e:
         logger.error(f"Error getting animation info: {str(e)}")
         return f"Error getting animation info: {str(e)}"
@@ -1056,6 +1109,7 @@ def render_preview(
         angle_order = ", ".join(str(img.get("angle", "?")) for img in images)
         content: list = [f"Preview renders, angles in order: {angle_order}"]
         for img in images:
+            _note_image_tokens(img.get("width"), img.get("height"))
             content.append(Image(
                 data=base64.b64decode(img["image_data"]),
                 format=img.get("format", "png")
@@ -1109,6 +1163,7 @@ def render_animation_preview(
         frame_order = ", ".join(str(f) for f in frames_sampled)
         content: list = [f"Animation preview, frames in order: {frame_order}"]
         for img in images:
+            _note_image_tokens(img.get("width"), img.get("height"))
             content.append(Image(
                 data=base64.b64decode(img["image_data"]),
                 format=img.get("format", "png")
@@ -1160,6 +1215,7 @@ def render_image(
             raise Exception(result["error"])
         if not result.get("image_data"):
             raise Exception("No image data was returned")
+        _note_image_tokens(result.get("width"), result.get("height"))
         return Image(
             data=base64.b64decode(result["image_data"]),
             format=result.get("format", "png")
@@ -1279,6 +1335,80 @@ def manage_project(
     except Exception as e:
         logger.error(f"Error managing project: {str(e)}")
         return f"Error managing project: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("manage_assignment")
+def manage_assignment(
+    ctx: Context,
+    action: str,
+    title: str = None,
+    brief: str = None,
+    plan: List[str] = None,
+    step: str = None,
+    done: bool = True,
+    decision: str = None,
+    note: str = None,
+    handoff: str = None,
+    user_prompt: str = ""
+) -> str:
+    """
+    Persistent assignment record for session continuity, stored inside the .blend
+    (plus a human-readable <name>.assignment.md sidecar next to saved files).
+
+    Workflow:
+    - Call action "read" at the START of any session on an existing file to get
+      up to speed cheaply (returns {"exists": false} if there is no record yet).
+    - Call "start" with a title and a plan BEFORE any multi-step build.
+    - Call "update" as steps complete and whenever a decision/convention is made.
+    - Call "handoff" when the assignment is done - then tell the user they can
+      continue in a NEW chat on this file: the next agent reads the assignment
+      record and scene directly for a fraction of the tokens.
+
+    Parameters:
+    - action: "start" | "update" | "read" | "handoff"
+    - title: Assignment title (required for "start")
+    - brief: Short description of the job ("start")
+    - plan: List of step strings ("start" creates the checklist; "update" appends)
+    - step: Substring of a plan step to mark, matched case-insensitively ("update")
+    - done: Mark the matched step done (default True) or not done ("update")
+    - decision: Append a decision/convention/constraint ("update")
+    - note: Append a dated progress note to the log ("update")
+    - handoff: Final summary + next steps text ("handoff")
+
+    Returns JSON: the full record plus sidecar_path ("read" also includes a
+    markdown rendering).
+    """
+    try:
+        blender = get_blender_connection()
+        params = {"action": action, "title": title, "brief": brief, "plan": plan,
+                  "step": step, "done": done, "decision": decision,
+                  "note": note, "handoff": handoff}
+        params = {k: v for k, v in params.items() if v is not None}
+        result = blender.send_command("manage_assignment", params)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error managing assignment: {str(e)}")
+        return f"Error managing assignment: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("get_session_stats")
+def get_session_stats(ctx: Context, user_prompt: str = "") -> str:
+    """
+    Approximate token usage of this chat's Blender tool output. Pure server-side
+    counters - does not contact Blender.
+
+    Check occasionally in long sessions. When "advisory" is non-null, relay it
+    to the user: it suggests Save & Continue (save the project, write an
+    assignment handoff, continue in a new chat) to conserve the chat's token
+    allowance.
+
+    Returns JSON {tool_calls, est_tokens, advisory: str|null}.
+    """
+    return json.dumps({
+        "tool_calls": _SESSION_STATS["tool_calls"],
+        "est_tokens": _SESSION_STATS["est_tokens"],
+        "advisory": _pending_advisory(),
+    }, indent=2)
 
 @mcp.tool()
 @telemetry_tool("undo_last_operation")
@@ -2075,6 +2205,15 @@ def asset_creation_strategy() -> str:
     **Recovering from mistakes**
     - undo_last_operation() reverts the last mutating MCP command
     - execute_blender_code(..., rollback_on_error=True) automatically undoes a script that raised
+
+    **Session continuity (assignment record)**
+    - At the START of a session on an existing file, call manage_assignment(action="read")
+      to pick up the assignment record (title, plan, decisions, log) cheaply.
+    - Before any multi-step build, call manage_assignment(action="start", title=..., plan=[...]).
+    - Keep it updated as you work: mark steps done and record decisions/conventions.
+    - When the assignment is complete, write a handoff (action="handoff") and suggest the
+      user continue further edits in a NEW chat - the next agent resumes from the
+      assignment record and scene for a fraction of the tokens.
     1. First use the following tools to verify if the following integrations are enabled:
         1. PolyHaven
             Use get_polyhaven_status() to verify its status
@@ -2200,6 +2339,10 @@ def animation_strategy() -> str:
     Performance note: every command must finish within 180 seconds. Keep renders small
     (low resolution/samples) and prefer render_preview / render_animation_preview over
     full renders while iterating.
+
+    Session continuity: keep the assignment record current with manage_assignment
+    (read at session start, update as steps land, handoff when done) - see the
+    asset_creation_strategy prompt for the full workflow.
     """
 
 # Main execution
