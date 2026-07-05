@@ -274,7 +274,15 @@ mcp = FastMCP(
 _blender_connection = None
 
 # Addon version this server release is designed to pair with
-EXPECTED_ADDON_VERSION = "1.7.0"
+EXPECTED_ADDON_VERSION = "1.7.1"
+
+# This server's own version (from installed package metadata; falls back to
+# the release version when running from an uninstalled source checkout)
+try:
+    from importlib.metadata import version as _pkg_version
+    SERVER_VERSION = _pkg_version("blender-mcp")
+except Exception:
+    SERVER_VERSION = "1.7.1"
 
 # Only warn once per server process about an outdated addon
 _addon_outdated_warned = False
@@ -310,6 +318,29 @@ def _check_addon_capabilities(connection):
             _warn_addon_outdated("Blender addon does not support get_capabilities.")
         else:
             logger.warning(f"Could not query addon capabilities: {str(e)}")
+
+
+def _send_client_info(connection):
+    """Report this server's version/name to the addon (best-effort).
+
+    The addon shows a panel warning when the versions diverge. Tolerates old
+    addons that don't implement set_client_info.
+    """
+    try:
+        result = connection.send_command(
+            "set_client_info", {"version": SERVER_VERSION, "name": "blender-mcp"}
+        )
+        if isinstance(result, dict) and result.get("match") is False:
+            logger.warning(
+                f"Version skew detected: server is {SERVER_VERSION} but the addon "
+                f"reports {result.get('addon_version', 'unknown')}. "
+                f"Please update addon.py in Blender (or the blender-mcp server)."
+            )
+    except Exception as e:
+        if "Unknown command type" in str(e):
+            _warn_addon_outdated("Blender addon does not support set_client_info.")
+        else:
+            logger.warning(f"Could not send client info to the addon: {str(e)}")
 
 
 def get_blender_connection():
@@ -351,6 +382,8 @@ def get_blender_connection():
         logger.info("Created new persistent connection to Blender")
         # Check addon capabilities / version skew on first successful connect
         _check_addon_capabilities(_blender_connection)
+        # Tell the addon who is connected so its panel can flag version skew
+        _send_client_info(_blender_connection)
 
     return _blender_connection
 

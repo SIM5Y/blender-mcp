@@ -11,6 +11,7 @@
 
 import importlib.util
 import os
+import re
 import sys
 import tempfile
 import time
@@ -71,19 +72,48 @@ def main():
 
     tmpdir = tempfile.mkdtemp(prefix="blendermcp_smoke_")
 
+    # --- version consistency (VERSION / pyproject.toml / addon) ----------
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(repo_root, "VERSION"), encoding="utf-8") as f:
+        version_file = f.read().strip()
+    with open(os.path.join(repo_root, "pyproject.toml"), encoding="utf-8") as f:
+        m = re.search(r'^version\s*=\s*"([^"]+)"', f.read(), re.MULTILINE)
+    pyproject_version = m.group(1) if m else None
+    bl_info_version = ".".join(str(n) for n in mod.bl_info.get("version", ()))
+    check("version consistency",
+          version_file == pyproject_version == mod.ADDON_VERSION == bl_info_version,
+          f"VERSION={version_file!r} pyproject={pyproject_version!r} "
+          f"ADDON_VERSION={mod.ADDON_VERSION!r} bl_info={bl_info_version!r}")
+
     # --- ping / get_capabilities ---------------------------------------
     r = run("ping")
-    check("ping payload", r.get("pong") is True and r.get("addon_version") == "1.7.0",
+    check("ping payload",
+          r.get("pong") is True and r.get("addon_version") == mod.ADDON_VERSION,
           str(r)[:200])
 
     r = run("get_capabilities")
-    check("capabilities version", r.get("addon_version") == "1.7.0", str(r)[:200])
+    check("capabilities version", r.get("addon_version") == mod.ADDON_VERSION,
+          str(r)[:200])
     check("capabilities commands", "get_scene_graph" in r.get("commands", []) and
           "set_transform" in r.get("commands", []), str(r.get("commands"))[:300])
     check("capabilities integrations",
           set(r.get("integrations", {}).keys()) ==
           {"polyhaven", "hyper3d", "sketchfab", "hunyuan3d"},
           str(r.get("integrations")))
+
+    # --- set_client_info handshake ---------------------------------------
+    r = run("set_client_info", version=mod.ADDON_VERSION, name="blender-mcp")
+    check("set_client_info match",
+          r.get("ok") is True and r.get("match") is True
+          and r.get("addon_version") == mod.ADDON_VERSION,
+          str(r)[:200])
+    check("set_client_info stored",
+          server.client_version == mod.ADDON_VERSION
+          and server.client_name == "blender-mcp",
+          f"version={server.client_version} name={server.client_name}")
+    r = run("set_client_info", version="0.0.1")
+    check("set_client_info mismatch",
+          r.get("ok") is True and r.get("match") is False, str(r)[:200])
 
     # --- scene introspection --------------------------------------------
     r = run("get_scene_info")
@@ -400,7 +430,18 @@ def main():
           str(resp)[:300])
     resp = server._execute_command_internal({"type": "ping", "params": {}})
     check("pause allows ping", resp.get("status") == "success", str(resp)[:300])
+    resp = server._execute_command_internal(
+        {"type": "set_client_info", "params": {"version": mod.ADDON_VERSION}})
+    check("pause allows set_client_info", resp.get("status") == "success",
+          str(resp)[:300])
     bpy.context.scene.blendermcp_paused = False
+
+    # --- update check must not run headless (auto-check is gated on
+    # bpy.app.background and deferred via a timer the test never spins) ------
+    check("update check not triggered headless",
+          mod._UPDATE_INFO["checked"] is False
+          and mod._UPDATE_INFO["checking"] is False,
+          str(mod._UPDATE_INFO))
 
     # --- undo_last (lenient: undo state differs headless) ---------------------
     resp = server._execute_command_internal({"type": "undo_last", "params": {}})

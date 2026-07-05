@@ -20,7 +20,7 @@ Give feedback, get inspired, and build on top of the MCP: [Discord](https://disc
 
 [Support this project](https://github.com/sponsors/ahujasid)
 
-## Current version(1.7.0)
+## Current version(1.7.1)
 - Structured tools for modelling, animation, cameras, rendering, and export — no hand-written Python needed for common operations
 - REPL-style code execution with persistent namespace, scene diffs, and optional rollback on error
 - Undo checkpoints before every AI mutation, plus an "Undo AI Action" button in the Blender panel
@@ -130,6 +130,23 @@ pipx ensurepath          # then restart your shell / client
 ```
 
 Use the resulting absolute path as `"command"` (find it with `which blender-mcp` / `where blender-mcp`) and omit `args`.
+
+### Running this fork from source
+
+`uvx blender-mcp` installs the **upstream PyPI package, not this fork**. To run this fork's server, point uvx at your local checkout instead:
+
+```json
+{
+    "mcpServers": {
+        "blender": {
+            "command": "uvx",
+            "args": ["--from", "D:\\Dev\\Tools\\MCP\\blender-mcp", "blender-mcp"]
+        }
+    }
+}
+```
+
+(replace the path with wherever you cloned this repository), or run it directly with `uv --directory <checkout> run blender-mcp`.
 
 ### Environment Variables
 
@@ -277,6 +294,7 @@ Once the config file has been set on Claude, and the addon is running on Blender
 - Export scenes (glTF/FBX/OBJ/USD), import local assets, and save/version projects
 - Download the right models, assets and HDRIs through [Poly Haven](https://polyhaven.com/)
 - AI generated 3D models through [Hyper3D Rodin](https://hyper3d.ai/)
+- Built-in update checker: the addon panel shows an "Update available" notice when a newer version is published on GitHub, with a manual "Check for Updates" button; the automatic once-per-session startup check can be toggled via the "Check for updates on startup" addon preference
 
 ##### Assignment continuity & token awareness
 

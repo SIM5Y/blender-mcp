@@ -27,16 +27,88 @@ from contextlib import redirect_stdout, suppress
 bl_info = {
     "name": "Blender MCP",
     "author": "BlenderMCP",
-    "version": (1, 7, 0),
+    "version": (1, 7, 1),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > BlenderMCP",
     "description": "Connect Blender to Claude via MCP",
     "category": "Interface",
 }
 
-ADDON_VERSION = "1.7.0"
+ADDON_VERSION = "1.7.1"
 
 RODIN_FREE_TRIAL_KEY = "vibecoding"
+
+# Update check: latest released version is published in the VERSION file on GitHub
+UPDATE_VERSION_URL = "https://raw.githubusercontent.com/SIM5Y/blender-mcp/main/VERSION"
+UPDATE_PAGE_URL = "https://github.com/SIM5Y/blender-mcp"
+
+# Update-check state (written by the background worker thread, read by the panel)
+_UPDATE_INFO = {
+    "checked": False,
+    "checking": False,
+    "latest": None,
+    "update_available": False,
+    "error": None,
+}
+
+# One-shot guard: schedule the automatic startup update check once per session
+_UPDATE_CHECK_SCHEDULED = False
+
+def _version_tuple(version_str):
+    """Parse a version string like "1.7.1" into (1, 7, 1); None if malformed."""
+    try:
+        return tuple(int(p) for p in str(version_str).strip().split("."))
+    except (ValueError, AttributeError):
+        return None
+
+def _tag_viewports_redraw():
+    """Schedule a VIEW_3D redraw on the main thread (safe from any thread)."""
+    def _tag():
+        try:
+            for w in bpy.context.window_manager.windows:
+                for a in w.screen.areas:
+                    if a.type == 'VIEW_3D':
+                        a.tag_redraw()
+        except Exception:
+            pass
+        return None
+    try:
+        bpy.app.timers.register(_tag, first_interval=0.0)
+    except Exception:
+        pass
+
+def _check_for_updates_async():
+    """Fetch the latest version from GitHub in a daemon thread.
+
+    Never blocks the UI or a command; all failures are swallowed into
+    _UPDATE_INFO["error"] (the panel just stays quiet on errors).
+    """
+    if _UPDATE_INFO["checking"]:
+        return
+    _UPDATE_INFO["checking"] = True
+    _UPDATE_INFO["error"] = None
+
+    def _worker():
+        try:
+            response = requests.get(UPDATE_VERSION_URL, timeout=(10, 60))
+            response.raise_for_status()
+            latest = response.text.strip()
+            latest_t = _version_tuple(latest)
+            current_t = _version_tuple(ADDON_VERSION)
+            _UPDATE_INFO["latest"] = latest or None
+            # Malformed local or remote version -> treat as "no update"
+            _UPDATE_INFO["update_available"] = bool(
+                latest_t is not None and current_t is not None and latest_t > current_t
+            )
+        except Exception as e:
+            _UPDATE_INFO["error"] = str(e)
+            _UPDATE_INFO["update_available"] = False
+        finally:
+            _UPDATE_INFO["checking"] = False
+            _UPDATE_INFO["checked"] = True
+            _tag_viewports_redraw()
+
+    threading.Thread(target=_worker, daemon=True).start()
 
 # Commands that modify the scene: an undo checkpoint is pushed before each one
 # so undo_last / rollback_on_error can revert the change.
@@ -237,6 +309,9 @@ class BlenderMCPServer:
         self.activity_log = collections.deque(maxlen=50)
         # Session token awareness: bytes sent over the socket (est. tokens = bytes/4)
         self.bytes_sent = 0
+        # MCP server (client) identity, reported via set_client_info handshake
+        self.client_version = None
+        self.client_name = None
         # Assignment token accounting (see manage_assignment / _assignment_tokens)
         self._assignment_token_base = None
         self._assignment_prior_tokens = 0
@@ -535,6 +610,7 @@ class BlenderMCPServer:
             "ping": self.ping,
             "get_capabilities": self.get_capabilities,
             "get_telemetry_consent": self.get_telemetry_consent,
+            "set_client_info": self.set_client_info,
             # Core
             "get_scene_info": self.get_scene_info,
             "get_scene_graph": self.get_scene_graph,
@@ -595,7 +671,7 @@ class BlenderMCPServer:
 
         # Pause switch: reject everything except lightweight status commands
         if getattr(bpy.context.scene, "blendermcp_paused", False) and \
-                cmd_type not in ("ping", "get_capabilities", "get_telemetry_consent"):
+                cmd_type not in ("ping", "get_capabilities", "get_telemetry_consent", "set_client_info"):
             return {
                 "status": "error",
                 "message": "Paused by the user in Blender. Stop and tell the user to press Resume in the BlenderMCP panel."
@@ -620,6 +696,19 @@ class BlenderMCPServer:
     def ping(self):
         """Lightweight liveness check (allowed while paused)"""
         return {"pong": True, "addon_version": ADDON_VERSION, "protocol": 1}
+
+    def set_client_info(self, version=None, name=None):
+        """Record the connected MCP server's version/name (allowed while paused).
+
+        The panel warns when the server and addon versions diverge.
+        """
+        self.client_version = version
+        self.client_name = name
+        return {
+            "ok": True,
+            "addon_version": ADDON_VERSION,
+            "match": version == ADDON_VERSION,
+        }
 
     def get_capabilities(self):
         """Report addon version, Blender version, integration toggles and available commands"""
@@ -4873,6 +4962,11 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
         description="Allow collection of prompts, code snippets, and screenshots to help improve Blender MCP",
         default=True
     )
+    auto_check_updates: BoolProperty(
+        name="Check for updates on startup",
+        description="Check GitHub for a newer BlenderMCP version once per Blender session (a few seconds after startup)",
+        default=True
+    )
     hyper3d_api_key: bpy.props.StringProperty(
         name="Hyper3D API Key",
         subtype="PASSWORD",
@@ -4964,6 +5058,16 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
         row = box.row()
         row.operator("blendermcp.open_terms", text="View Terms and Conditions", icon='TEXT')
 
+        # Updates section
+        layout.separator()
+        layout.label(text="Updates:", icon='FILE_REFRESH')
+        box = layout.box()
+        box.prop(self, "auto_check_updates")
+        row = box.row()
+        row.operator("blendermcp.check_updates", text="Check for Updates", icon='FILE_REFRESH')
+        if _UPDATE_INFO["update_available"] and _UPDATE_INFO["latest"]:
+            row.operator("blendermcp.open_update_page", text="Get Update", icon='URL')
+
         layout.separator()
         layout.label(text="Persistent API Credentials:", icon='LOCKED')
         cred_box = layout.box()
@@ -5016,6 +5120,24 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
                 row.operator("blendermcp.dismiss_error", text="", icon='X')
         else:
             box.label(text="Server not running", icon='CANCEL')
+
+        # Server<->addon version skew (reported via the set_client_info handshake)
+        if server and getattr(server, "client_version", None) and \
+                server.client_version != ADDON_VERSION:
+            row = box.row()
+            row.alert = True
+            row.label(
+                text=f"Server v{server.client_version} ≠ addon v{ADDON_VERSION} — update addon.py or the server",
+                icon='ERROR')
+
+        # Addon update notice (filled in by the async update check)
+        if _UPDATE_INFO["update_available"] and _UPDATE_INFO["latest"]:
+            row = box.row()
+            row.alert = True
+            row.label(
+                text=f"Update available: v{_UPDATE_INFO['latest']} (installed v{ADDON_VERSION})",
+                icon='IMPORT')
+            row.operator("blendermcp.open_update_page", text="Get Update")
 
         # --- Controls row ---
         row = layout.row(align=True)
@@ -5093,6 +5215,7 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
         consent = bool(prefs.telemetry_consent) if prefs is not None else True
         row.label(text=f"Telemetry: {'On' if consent else 'Off'}",
                   icon='RADIOBUT_ON' if consent else 'RADIOBUT_OFF')
+        row.operator("blendermcp.check_updates", text="", icon='FILE_REFRESH')
         row.operator("blendermcp.open_prefs", text="", icon='PREFERENCES')
 
 # Operator to set Hyper3D API Key
@@ -5169,6 +5292,35 @@ class BLENDERMCP_OT_OpenTerms(bpy.types.Operator):
         except Exception as e:
             self.report({'ERROR'}, f"Could not open Terms and Conditions: {str(e)}")
         
+        return {'FINISHED'}
+
+# Operator to check GitHub for a newer addon version (async, never blocks)
+class BLENDERMCP_OT_CheckUpdates(bpy.types.Operator):
+    bl_idname = "blendermcp.check_updates"
+    bl_label = "Check for Updates"
+    bl_description = "Check GitHub for a newer version of BlenderMCP (runs in the background)"
+
+    def execute(self, context):
+        if _UPDATE_INFO["checking"]:
+            self.report({'INFO'}, "Update check already in progress")
+            return {'FINISHED'}
+        _check_for_updates_async()
+        self.report({'INFO'}, "Checking for updates in the background...")
+        return {'FINISHED'}
+
+# Operator to open the update/download page on GitHub
+class BLENDERMCP_OT_OpenUpdatePage(bpy.types.Operator):
+    bl_idname = "blendermcp.open_update_page"
+    bl_label = "Get Update"
+    bl_description = "Open the BlenderMCP GitHub page to download the latest version"
+
+    def execute(self, context):
+        try:
+            import webbrowser
+            webbrowser.open(UPDATE_PAGE_URL)
+        except Exception as e:
+            self.report({'ERROR'}, f"Could not open update page: {str(e)}")
+            return {'CANCELLED'}
         return {'FINISHED'}
 
 # Operator to dismiss the last error shown in the panel status box
@@ -5410,6 +5562,8 @@ def register():
     bpy.utils.register_class(BLENDERMCP_OT_UndoLastAI)
     bpy.utils.register_class(BLENDERMCP_OT_DumpLog)
     bpy.utils.register_class(BLENDERMCP_OT_OpenPrefs)
+    bpy.utils.register_class(BLENDERMCP_OT_CheckUpdates)
+    bpy.utils.register_class(BLENDERMCP_OT_OpenUpdatePage)
 
     # Keep the .assignment.md sidecar current on every save (plain Ctrl+S too).
     # Guard against double-append on addon reload: the function object changes
@@ -5437,6 +5591,32 @@ def register():
         except AttributeError:
             pass
 
+    # Deferred startup update check: once per Blender session, never in
+    # background mode (headless/CI), never synchronously in register().
+    # The auto_check_updates preference is read inside the timer callback so
+    # the addon preferences entry is guaranteed to exist by then.
+    global _UPDATE_CHECK_SCHEDULED
+    if not bpy.app.background and not _UPDATE_CHECK_SCHEDULED:
+        _UPDATE_CHECK_SCHEDULED = True
+
+        def _deferred_update_check():
+            try:
+                addon_entry = bpy.context.preferences.addons.get(__name__)
+                auto_check = True
+                if addon_entry is not None:
+                    auto_check = bool(getattr(addon_entry.preferences,
+                                              "auto_check_updates", True))
+                if auto_check and not _UPDATE_INFO["checked"] and not _UPDATE_INFO["checking"]:
+                    _check_for_updates_async()
+            except Exception:
+                pass
+            return None
+
+        try:
+            bpy.app.timers.register(_deferred_update_check, first_interval=3.0)
+        except Exception:
+            pass
+
     print("BlenderMCP addon registered")
 
 def unregister():
@@ -5460,6 +5640,8 @@ def unregister():
     bpy.utils.unregister_class(BLENDERMCP_OT_UndoLastAI)
     bpy.utils.unregister_class(BLENDERMCP_OT_DumpLog)
     bpy.utils.unregister_class(BLENDERMCP_OT_OpenPrefs)
+    bpy.utils.unregister_class(BLENDERMCP_OT_CheckUpdates)
+    bpy.utils.unregister_class(BLENDERMCP_OT_OpenUpdatePage)
     bpy.utils.unregister_class(BLENDERMCP_AddonPreferences)
 
     del bpy.types.Scene.blendermcp_port
