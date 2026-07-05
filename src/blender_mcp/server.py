@@ -287,7 +287,7 @@ try:
     from importlib.metadata import version as _pkg_version
     SERVER_VERSION = _pkg_version("blender-mcp")
 except Exception:
-    SERVER_VERSION = "1.8.2"
+    SERVER_VERSION = "1.8.3"
 
 # Server and addon are released in lockstep from one repo (the VERSION file is
 # the single source of truth), so the addon this server pairs with is simply
@@ -587,6 +587,56 @@ def execute_blender_code(
     except Exception as e:
         logger.error(f"Error executing code: {str(e)}")
         return f"Error executing code: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("batch_commands")
+def batch_commands(
+    ctx: Context,
+    commands: List[Dict[str, Any]],
+    stop_on_error: bool = True,
+    user_prompt: str = ""
+) -> str:
+    """
+    Run up to 25 Blender commands sequentially in ONE round-trip (one tool call).
+
+    WHEN: whenever your client meters steps/turns, combine consecutive structured
+    calls - build stages, multi-object setups, keyframe passes - into one batch
+    instead of one tool call each; then verify with ONE render_preview at stage
+    boundaries instead of after every edit. One undo checkpoint covers the whole
+    batch, so undo_last_operation reverts it as a unit.
+
+    Parameters:
+    - commands: List of {"type": str, "params": dict}. "type" is the underlying
+      command name matching the other tools: set_transform, place_object,
+      manage_modifiers, boolean_op, organize_scene, set_keyframes,
+      set_keyframe_interpolation, delete_keyframes, manage_timeline, set_camera,
+      manage_sequence, execute_code, manage_assignment, manage_project,
+      get_scene_graph, get_object_info, export_scene, import_local_asset, ...
+      (see get_capabilities' command list). "params" holds that command's
+      parameters exactly as the matching single tool sends them.
+    - stop_on_error: If True (default), the first failing sub-command stops the
+      batch; remaining entries are reported as {"ok": null, "skipped": true}.
+      If False, every sub-command runs and failures are reported inline.
+
+    NOT allowed inside a batch: batch_commands (no nesting) and render_sequence
+    with wait=True or wait omitted (long encodes would block the socket);
+    render_sequence with wait=False or status_only=True IS allowed, and so is
+    execute_code.
+
+    Returns JSON {executed, total, stopped_early, results: [{type, ok,
+    result|error, skipped?}]}. Oversized sub-results are truncated to summaries
+    (with a "note") when the combined payload would exceed ~100KB.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("batch_commands", {
+            "commands": commands,
+            "stop_on_error": stop_on_error,
+        })
+        return _with_advisory(json.dumps(result, indent=2))
+    except Exception as e:
+        logger.error(f"Error executing batch: {str(e)}")
+        return f"Error executing batch: {str(e)}"
 
 # Structured scene tools (addon >= 1.7.0)
 
@@ -2410,6 +2460,18 @@ def asset_creation_strategy() -> str:
     - undo_last_operation() reverts the last mutating MCP command
     - execute_blender_code(..., rollback_on_error=True) automatically undoes a script that raised
 
+    **Step/turn budget discipline** (critical when your client meters steps or turns)
+    - Prefer batch_commands() for consecutive structured edits: combine build stages,
+      multi-object setups and keyframe passes into ONE call instead of one call each.
+    - Verify visually at STAGE boundaries - one render_preview() per stage - not after
+      every mutation: execute_blender_code already returns scene_diff and structured
+      tools return their post-state, so most edits need no extra verification call.
+    - Update manage_assignment at each stage boundary so a session killed by a client
+      step cap is resumable: the user pastes the same prompt in a new chat and the
+      next agent continues from the record.
+    - At session start on an existing file, ALWAYS call manage_assignment(action="read")
+      first - if a prior record exists, continue its plan instead of restarting.
+
     **Session continuity (assignment record)**
     - Before any file operation or multi-step build: check get_scene_info's filepath to
       confirm WHICH file is open - never assume. To work on a copy, prefer manage_project
@@ -2551,6 +2613,18 @@ def animation_strategy() -> str:
     Performance note: every command must finish within 180 seconds. Keep renders small
     (low resolution/samples) and prefer render_preview / render_animation_preview over
     full renders while iterating.
+
+    Step/turn budget discipline (critical when your client meters steps or turns):
+    - Prefer batch_commands() for consecutive structured edits - a whole keyframe
+      pass (set_keyframes on several objects + set_keyframe_interpolation +
+      manage_timeline) fits in ONE call.
+    - Verify visually at STAGE boundaries (one render_animation_preview per blocking/
+      easing pass), not after every keyframe: structured tools already return their
+      post-state and execute_blender_code returns scene_diff.
+    - Update manage_assignment at each stage boundary so a session killed by a client
+      step cap is resumable by pasting the same prompt in a new chat.
+    - At session start on an existing file, ALWAYS call manage_assignment(action="read")
+      first - if a prior record exists, continue its plan instead of restarting.
 
     Session continuity: keep the assignment record current with manage_assignment
     (read at session start, update as steps land, handoff when done) - see the

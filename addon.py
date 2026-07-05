@@ -27,14 +27,14 @@ from contextlib import redirect_stdout, suppress
 bl_info = {
     "name": "Blender MCP",
     "author": "BlenderMCP",
-    "version": (1, 8, 2),
+    "version": (1, 8, 3),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > BlenderMCP",
     "description": "Connect Blender to Claude via MCP",
     "category": "Interface",
 }
 
-ADDON_VERSION = "1.8.2"
+ADDON_VERSION = "1.8.3"
 
 # Shown to agents talking through a legacy (pre-1.7.1 handshake) MCP server;
 # such servers drop stdout/errors from the new execute_code result shape.
@@ -145,6 +145,19 @@ MUTATING_COMMANDS = {
     "import_generated_asset",
     "import_generated_asset_hunyuan",
 }
+
+# batch_commands: max sub-commands per batch and response payload budget.
+# One batch = one socket round-trip = one agent step on step-metered clients.
+BATCH_MAX_COMMANDS = 25
+BATCH_MAX_PAYLOAD_CHARS = 100_000
+
+def _summarize_command_types(counts, top=5):
+    """Format a {command_type: count} dict as 'a x3, b x2' (top N by count)."""
+    try:
+        ranked = sorted((counts or {}).items(), key=lambda kv: (-kv[1], kv[0]))
+        return ", ".join(f"{name} x{n}" for name, n in ranked[:top]) or "none"
+    except Exception:
+        return "none"
 
 # Valid keyframe interpolation / easing identifiers (Blender 4.2+ and 5.x)
 KEYFRAME_INTERPOLATIONS = {
@@ -660,13 +673,33 @@ class BlenderMCPServer:
                             # Push an undo checkpoint before mutating commands
                             # (skipped while paused - the command will be rejected anyway)
                             conn_stats["commands"] += 1
-                            if cmd_type in MUTATING_COMMANDS and \
-                                    not getattr(bpy.context.scene, "blendermcp_paused", False):
-                                conn_stats["mutated"] = True
-                                try:
-                                    bpy.ops.ed.undo_push(message=f"MCP: {cmd_type}")
-                                except Exception as undo_err:
-                                    print(f"Undo push failed: {str(undo_err)}")
+                            batch_sub_types = []
+                            if cmd_type == "batch_commands":
+                                batch_sub_types = BlenderMCPServer._batch_sub_types(
+                                    command.get("params", {}))
+                            # Per-connection command-type counts (session record on disconnect)
+                            try:
+                                counts = conn_stats.setdefault("types", {})
+                                for t in [cmd_type] + batch_sub_types:
+                                    counts[t] = counts.get(t, 0) + 1
+                            except Exception:
+                                pass
+                            if not getattr(bpy.context.scene, "blendermcp_paused", False):
+                                if cmd_type in MUTATING_COMMANDS:
+                                    conn_stats["mutated"] = True
+                                    try:
+                                        bpy.ops.ed.undo_push(message=f"MCP: {cmd_type}")
+                                    except Exception as undo_err:
+                                        print(f"Undo push failed: {str(undo_err)}")
+                                elif batch_sub_types and \
+                                        any(t in MUTATING_COMMANDS for t in batch_sub_types):
+                                    # ONE checkpoint for the whole batch (not per sub-command)
+                                    conn_stats["mutated"] = True
+                                    try:
+                                        bpy.ops.ed.undo_push(
+                                            message=f"MCP: batch of {len(batch_sub_types)}")
+                                    except Exception as undo_err:
+                                        print(f"Undo push failed: {str(undo_err)}")
 
                             response = None
                             try:
@@ -729,7 +762,9 @@ class BlenderMCPServer:
                 self.client_connected = False
                 self.client_address = None
                 self._redraw_ui()
-            # Session ended: optionally snapshot a version of the work
+            # Session ended: leave resume context, then optionally snapshot a
+            # version of the work (record first, so the snapshot contains it)
+            self._maybe_record_session(conn_stats)
             self._maybe_auto_version(conn_stats)
             print("Client handler stopped")
 
@@ -772,6 +807,78 @@ class BlenderMCPServer:
             bpy.app.timers.register(_auto_version, first_interval=0.0)
         except Exception:
             pass
+
+    def _maybe_record_session(self, conn_stats):
+        """Guarantee a mutating session leaves resume context on disconnect.
+
+        Runs on the socket thread; the actual record write is scheduled on
+        Blender's main thread via bpy.app.timers. Only fires when the session
+        executed at least one command AND at least one mutating command ran.
+        Never raises.
+        """
+        try:
+            if not conn_stats.get("commands") or not conn_stats.get("mutated"):
+                return
+
+            def _record():
+                try:
+                    self._record_session_now(conn_stats)
+                except Exception as e:
+                    print(f"BlenderMCP: session record failed: {str(e)}")
+                return None
+
+            bpy.app.timers.register(_record, first_interval=0.0)
+        except Exception:
+            pass
+
+    def _record_session_now(self, conn_stats):
+        """Main-thread body of the session-record safety net.
+
+        On a saved file: if no assignment record exists, auto-create a stub so
+        the next agent has resume context even when this session never called
+        manage_assignment; if a record exists, append a session-summary note.
+        """
+        if not bpy.data.filepath:
+            return
+        total = int(conn_stats.get("commands", 0) or 0)
+        summary = _summarize_command_types(conn_stats.get("types"))
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        note = f"[{now}] auto: session ran {total} commands ({summary})"
+
+        record = _assignment_load()
+        if record is None:
+            stem = os.path.splitext(os.path.basename(bpy.data.filepath))[0]
+            record = {
+                "version": 1,
+                "title": f"{stem} — untracked session",
+                "brief": "Auto-created: an agent session modified this file "
+                         "without starting an assignment.",
+                "created": now,
+                "updated": now,
+                "status": "active",
+                "plan": [],
+                "decisions": [],
+                "log": [],
+                "handoff": None,
+                "token_estimate": 0,
+            }
+        record.setdefault("log", []).append(note)
+        record["log"] = record["log"][-100:]
+        record["updated"] = now
+        try:
+            record["token_estimate"] = self._assignment_tokens(record)
+        except Exception:
+            pass
+        _assignment_store(record)
+        self.activity_log.append({
+            "time": time.strftime("%H:%M:%S"),
+            "type": "session_record",
+            "status": "ok",
+            "duration_ms": 0,
+            "summary": "session record updated",
+        })
+        print("BlenderMCP: session record updated")
+        self._redraw_ui()
 
     def _log_activity(self, cmd_type, command, response, start_time):
         """Record a command execution in the activity log (read by the UI panel)"""
@@ -859,6 +966,7 @@ class BlenderMCPServer:
             "get_viewport_screenshot": self.get_viewport_screenshot,
             "execute_code": self.execute_code,
             "undo_last": self.undo_last,
+            "batch_commands": self.batch_commands,
             # Modelling
             "set_transform": self.set_transform,
             "place_object": self.place_object,
@@ -1041,6 +1149,112 @@ class BlenderMCPServer:
         except Exception as e:
             raise Exception(f"Undo failed: {str(e)}")
         return {"undone": True}
+
+    @staticmethod
+    def _batch_sub_types(params):
+        """Sub-command types of a batch_commands invocation.
+
+        Used by execute_wrapper (single undo checkpoint + per-connection
+        mutation flag / command-type counts) before the handler runs.
+        """
+        entries = (params or {}).get("commands") or []
+        if not isinstance(entries, list):
+            return []
+        return [str(e.get("type", "?")) for e in entries if isinstance(e, dict)]
+
+    def batch_commands(self, commands, stop_on_error=True):
+        """Run up to BATCH_MAX_COMMANDS commands sequentially in one round-trip.
+
+        Dispatches each {"type", "params"} entry through the same handler
+        registry as single commands. The undo checkpoint for the whole batch
+        is pushed by execute_wrapper (one push, not per sub-command).
+        """
+        if not isinstance(commands, list) or not commands:
+            raise ValueError(
+                "commands must be a non-empty list of {'type': str, 'params': dict} entries."
+            )
+        if len(commands) > BATCH_MAX_COMMANDS:
+            raise ValueError(
+                f"Too many commands in one batch ({len(commands)}). "
+                f"Max is {BATCH_MAX_COMMANDS} - split into multiple batches."
+            )
+        # Validate every entry (incl. the denylist) BEFORE executing anything,
+        # so a malformed batch never leaves the scene half-modified.
+        for i, entry in enumerate(commands):
+            if not isinstance(entry, dict) or not entry.get("type"):
+                raise ValueError(
+                    f"commands[{i}] must be a dict with a non-empty 'type' key."
+                )
+            sub_type = str(entry["type"])
+            sub_params = entry.get("params") or {}
+            if not isinstance(sub_params, dict):
+                raise ValueError(f"commands[{i}].params must be a dict.")
+            if sub_type == "batch_commands":
+                raise ValueError(
+                    f"commands[{i}]: nested batch_commands is not allowed."
+                )
+            if sub_type == "render_sequence" and not sub_params.get("status_only") \
+                    and sub_params.get("wait", True):
+                raise ValueError(
+                    f"commands[{i}]: render_sequence with wait=True (or wait "
+                    "omitted) cannot run inside a batch - a long encode would "
+                    "block the socket. Call it as a separate command, or use "
+                    "wait=False / status_only=True inside the batch."
+                )
+
+        results = []
+        executed = 0
+        stopped_early = False
+        for entry in commands:
+            sub_type = str(entry["type"])
+            sub_params = entry.get("params") or {}
+            if stopped_early:
+                results.append({"type": sub_type, "ok": None, "skipped": True})
+                continue
+            resp = self._execute_command_internal(
+                {"type": sub_type, "params": sub_params})
+            executed += 1
+            if isinstance(resp, dict) and resp.get("status") == "success":
+                results.append(
+                    {"type": sub_type, "ok": True, "result": resp.get("result")})
+            else:
+                message = resp.get("message") if isinstance(resp, dict) else str(resp)
+                results.append({"type": sub_type, "ok": False, "error": message})
+                if stop_on_error:
+                    stopped_early = True
+
+        result = {
+            "executed": executed,
+            "total": len(commands),
+            "stopped_early": stopped_early,
+            "results": results,
+        }
+        # Overall payload cap: if the combined response would exceed the
+        # budget, shrink the largest sub-results to summaries and say so.
+        try:
+            if len(json.dumps(result)) > BATCH_MAX_PAYLOAD_CHARS:
+                truncated = 0
+                for r in results:
+                    if "result" not in r:
+                        continue
+                    try:
+                        serialized = json.dumps(r["result"])
+                    except Exception:
+                        serialized = str(r.get("result"))
+                    if len(serialized) > 4000:
+                        r["result"] = {
+                            "truncated": True,
+                            "summary": serialized[:1000] + "... [truncated]",
+                        }
+                        truncated += 1
+                result["note"] = (
+                    f"{truncated} sub-result(s) truncated to summaries - the "
+                    f"combined batch payload exceeded ~{BATCH_MAX_PAYLOAD_CHARS // 1000}KB. "
+                    "Re-run an individual command to get its full result."
+                )
+        except Exception:
+            pass
+        return result
 
     def _integration_disabled_error(self, scene_prop, label):
         """Return a disabled-error dict if the integration toggle is off, else None"""

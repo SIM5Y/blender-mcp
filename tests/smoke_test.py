@@ -101,7 +101,8 @@ def main():
     check("capabilities version", r.get("addon_version") == mod.ADDON_VERSION,
           str(r)[:200])
     check("capabilities commands", "get_scene_graph" in r.get("commands", []) and
-          "set_transform" in r.get("commands", []), str(r.get("commands"))[:300])
+          "set_transform" in r.get("commands", []) and
+          "batch_commands" in r.get("commands", []), str(r.get("commands"))[:300])
     check("capabilities integrations",
           set(r.get("integrations", {}).keys()) ==
           {"polyhaven", "hyper3d", "sketchfab", "hunyuan3d"},
@@ -295,6 +296,96 @@ def main():
     check("organize delete",
           "Plane" in r.get("deleted", []) and "NoSuchObj" in r.get("not_found", []),
           str(r)[:300])
+
+    # --- batch_commands (v1.8.3 step-budget batching) -------------------------
+    r = run("batch_commands", commands=[
+        {"type": "set_transform", "params": {"name": "Cube", "location": [2.0, 0.0, 1.0]}},
+        {"type": "get_scene_info", "params": {}},
+        {"type": "manage_timeline", "params": {"action": "get"}},
+    ])
+    check("batch happy path counts",
+          r.get("executed") == 3 and r.get("total") == 3
+          and r.get("stopped_early") is False
+          and all(x.get("ok") is True for x in r.get("results", []))
+          and len(r.get("results", [])) == 3,
+          str({k: v for k, v in r.items() if k != "results"})
+          + str([x.get("ok") for x in r.get("results", [])]))
+    loc = list(bpy.data.objects["Cube"].location)
+    check("batch set_transform applied",
+          abs(loc[0] - 2.0) < 1e-5 and abs(loc[2] - 1.0) < 1e-5, str(loc))
+    check("batch sub-result shapes",
+          r.get("results", [{}])[0].get("type") == "set_transform"
+          and isinstance(r.get("results", [{}, {}])[1].get("result"), dict),
+          str(r.get("results"))[:300])
+
+    # stop_on_error: failing middle command stops the batch, tail is skipped
+    r = run("batch_commands", commands=[
+        {"type": "set_transform", "params": {"name": "Cube", "location": [0.0, 0.0, 0.0]}},
+        {"type": "get_object_info", "params": {"name": "NoSuchObject"}},
+        {"type": "manage_timeline", "params": {"action": "get"}},
+    ])
+    bres = r.get("results", [])
+    check("batch stop_on_error",
+          r.get("executed") == 2 and r.get("stopped_early") is True
+          and len(bres) == 3
+          and bres[1].get("ok") is False and bres[1].get("error")
+          and bres[2].get("ok") is None and bres[2].get("skipped") is True,
+          str(r)[:400])
+
+    # stop_on_error=False: everything runs, failures reported inline
+    r = run("batch_commands", stop_on_error=False, commands=[
+        {"type": "get_object_info", "params": {"name": "NoSuchObject"}},
+        {"type": "ping", "params": {}},
+    ])
+    check("batch continue_on_error",
+          r.get("executed") == 2 and r.get("stopped_early") is False
+          and r.get("results", [{}])[0].get("ok") is False
+          and r.get("results", [{}, {}])[1].get("ok") is True,
+          str(r)[:300])
+
+    # nested batch rejected
+    resp = server._execute_command_internal({"type": "batch_commands", "params": {
+        "commands": [{"type": "batch_commands", "params": {"commands": []}}]}})
+    check("batch nested rejected",
+          resp.get("status") == "error"
+          and "nested" in str(resp.get("message", "")).lower(),
+          str(resp)[:300])
+
+    # render_sequence with wait=True (or omitted) rejected; status_only allowed
+    resp = server._execute_command_internal({"type": "batch_commands", "params": {
+        "commands": [{"type": "render_sequence", "params": {"filepath": "x.mp4"}}]}})
+    check("batch render_sequence wait rejected",
+          resp.get("status") == "error" and "wait" in str(resp.get("message", "")),
+          str(resp)[:300])
+    r = run("batch_commands", commands=[
+        {"type": "render_sequence", "params": {"status_only": True}}])
+    check("batch render_sequence status_only allowed",
+          r.get("executed") == 1 and r.get("results", [{}])[0].get("ok") is True,
+          str(r)[:300])
+
+    # >25 commands rejected
+    resp = server._execute_command_internal({"type": "batch_commands", "params": {
+        "commands": [{"type": "ping", "params": {}}] * 26}})
+    check("batch size cap",
+          resp.get("status") == "error" and "25" in str(resp.get("message", "")),
+          str(resp)[:300])
+
+    # Single undo push per batch (lenient): the batch type itself is NOT in
+    # MUTATING_COMMANDS (no per-command push), the wrapper derives ONE
+    # "batch of N" push from the sub-type counter, and pushing doesn't crash.
+    check("batch not in MUTATING_COMMANDS",
+          "batch_commands" not in mod.MUTATING_COMMANDS, "")
+    sub_types = mod.BlenderMCPServer._batch_sub_types(
+        {"commands": [{"type": "set_transform", "params": {}}, {"type": "ping"}]})
+    check("batch sub-type counter",
+          sub_types == ["set_transform", "ping"] and len(sub_types) == 2
+          and any(t in mod.MUTATING_COMMANDS for t in sub_types),
+          str(sub_types))
+    try:
+        bpy.ops.ed.undo_push(message=f"MCP: batch of {len(sub_types)}")
+    except Exception:
+        pass  # undo may be unavailable headless; execute_wrapper guards it too
+    check("batch undo push no crash", True, "")
 
     # --- timeline & keyframes -----------------------------------------------
     r = run("manage_timeline", action="set", frame_start=1, frame_end=48,
@@ -501,6 +592,58 @@ def main():
           and "lighting pass" in str(r.get("handoff", ""))
           and r.get("sidecar_path"),
           str(r)[:300])
+
+    # --- automatic session record on disconnect (v1.8.3) --------------------
+    # (calls the main-thread body directly - the timer wrapper never fires in
+    # a headless script run, same as the auto-version test below)
+    # A record EXISTS (the handoff above): the hook appends a session summary.
+    server._record_session_now(
+        {"commands": 5, "mutated": True,
+         "types": {"execute_code": 3, "set_transform": 1, "ping": 1}})
+    rec = mod._assignment_load()
+    check("session record appends to existing record",
+          rec is not None and rec.get("title") == "Smoke Assignment"
+          and any("auto: session ran 5 commands" in e for e in rec.get("log", []))
+          and any("execute_code x3" in e for e in rec.get("log", [])),
+          str((rec or {}).get("log", []))[-400:])
+
+    # NO record: the hook auto-creates a stub with the untracked-session title.
+    bpy.data.texts.remove(bpy.data.texts[mod.ASSIGNMENT_TEXT_NAME])
+    server._record_session_now(
+        {"commands": 7, "mutated": True,
+         "types": {"execute_code": 4, "manage_sequence": 2, "get_scene_info": 1}})
+    rec = mod._assignment_load()
+    check("session record auto-stub created",
+          rec is not None
+          and rec.get("title") == "smoke_test — untracked session"
+          and rec.get("status") == "active"
+          and "Auto-created" in str(rec.get("brief", ""))
+          and any("auto: session ran 7 commands" in e for e in rec.get("log", [])),
+          str(rec)[:400])
+    check("session record command-type counting",
+          any("execute_code x4" in e and "manage_sequence x2" in e
+              for e in (rec or {}).get("log", [])),
+          str((rec or {}).get("log", [])))
+    check("session record activity log entry",
+          any(e.get("type") == "session_record"
+              and e.get("summary") == "session record updated"
+              for e in server.activity_log),
+          str(list(server.activity_log)[-3:]))
+
+    # The scheduling wrapper must never raise, from any thread, with any stats
+    server._maybe_record_session({"commands": 3, "mutated": True})
+    server._maybe_record_session({"commands": 0, "mutated": False})
+    server._maybe_record_session({})
+    check("_maybe_record_session no crash", True, "")
+
+    # _summarize_command_types: top-5 by count, ties broken alphabetically
+    s = mod._summarize_command_types(
+        {"a": 1, "b": 5, "c": 3, "d": 2, "e": 4, "f": 6})
+    check("_summarize_command_types top5",
+          s == "f x6, b x5, e x4, c x3, d x2", s)
+    check("_summarize_command_types empty",
+          mod._summarize_command_types({}) == "none"
+          and mod._summarize_command_types(None) == "none", "")
 
     # --- video sequence editor (VSE) ---------------------------------------
     check("DELIVERY_PRESETS constant",

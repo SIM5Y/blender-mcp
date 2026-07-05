@@ -57,6 +57,7 @@ For the current version and changelog, see the [releases page](https://github.co
 - **Pipeline**: Export (glTF/FBX/OBJ/USD), import local assets, save/version .blend projects
 - **Video editing & delivery (VSE)**: Assemble rendered shots, text overlays, transitions and fades in the sequencer, then encode platform-preset deliverables (LinkedIn wide/square/vertical) — Blender as a complete production studio
 - **Safety & control**: Undo checkpoints for AI actions, pause switch, and activity log in the Blender panel
+- **Budget hardening**: `batch_commands` runs up to 25 commands in one round-trip for step-metered clients, and every mutating session automatically leaves an assignment record on disconnect so work is always resumable
 
 ## Components
 
