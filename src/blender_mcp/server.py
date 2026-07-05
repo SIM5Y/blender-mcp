@@ -2410,6 +2410,10 @@ def asset_creation_strategy() -> str:
     - When the assignment is complete, write a handoff (action="handoff") and suggest the
       user continue further edits in a NEW chat - the next agent resumes from the
       assignment record and scene for a fraction of the tokens.
+    - If the work belongs to a campaign, locate the campaign folder (campaign.json), read
+      it and the brand's video-brand-pack.json it references, and honor
+      colors/title_pairs/fonts/logo guardrails in all titles and materials. Campaign
+      workspace root: D:\\Dev\\VideoProduction.
     1. First use the following tools to verify if the following integrations are enabled:
         1. PolyHaven
             Use get_polyhaven_status() to verify its status
@@ -2545,6 +2549,11 @@ def animation_strategy() -> str:
 def production_strategy() -> str:
     """Defines the preferred workflow for editing and delivering video in Blender"""
     return """When assembling and delivering video from Blender (the VSE), follow this workflow:
+
+    0. Campaign context: if the work belongs to a campaign, locate the campaign
+       folder (campaign.json), read it and the brand's video-brand-pack.json it
+       references, and honor colors/title_pairs/fonts/logo guardrails in all
+       titles and materials. Campaign workspace root: D:\\Dev\\VideoProduction.
 
     1. Format first: call get_delivery_presets(), then manage_sequence
        action="setup_timeline" with the TARGET preset (LINKEDIN_WIDE / SQUARE /
