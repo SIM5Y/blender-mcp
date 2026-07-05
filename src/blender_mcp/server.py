@@ -28,6 +28,14 @@ logger = logging.getLogger("BlenderMCPServer")
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 9876
 
+# Platform delivery presets for VSE encodes.
+# Keep in sync with DELIVERY_PRESETS in addon.py.
+DELIVERY_PRESETS = {
+    "LINKEDIN_WIDE": {"resolution": [1920, 1080], "fps": 25},
+    "SQUARE": {"resolution": [1080, 1080], "fps": 25},
+    "VERTICAL": {"resolution": [1080, 1920], "fps": 25},
+}
+
 # ---------------------------------------------------------------------------
 # Session token awareness: approximate token burn of this chat's tool output.
 # est_tokens ~= response bytes / 4, plus (width*height)/750 per returned image.
@@ -1424,6 +1432,161 @@ def manage_assignment(
         return f"Error managing assignment: {str(e)}"
 
 @mcp.tool()
+@telemetry_tool("manage_sequence")
+def manage_sequence(
+    ctx: Context,
+    action: str,
+    preset: str = None,
+    resolution: List[int] = None,
+    fps: float = None,
+    frame_start: int = None,
+    frame_end: int = None,
+    filepath: str = None,
+    channel: int = None,
+    name: str = None,
+    fit: str = "FIT",
+    text: str = None,
+    duration: int = None,
+    size: int = 64,
+    color: List[float] = None,
+    position: str = "BOTTOM",
+    font_path: str = None,
+    strip_a: str = None,
+    strip_b: str = None,
+    type: str = None,
+    strip_name: str = None,
+    fade_type: str = "IN",
+    mute: bool = None,
+    volume: float = None,
+    opacity: float = None,
+    speed: float = None,
+    end_frame: int = None,
+    confirm: bool = False,
+    user_prompt: str = ""
+) -> str:
+    """
+    Edit video in Blender's sequencer (VSE). ALL times are FRAMES, not seconds
+    (frame = round(seconds * fps)). Actions:
+
+    - "setup_timeline": preset ("LINKEDIN_WIDE"|"SQUARE"|"VERTICAL", see
+      get_delivery_presets) or explicit resolution [w,h] / fps; frame_start
+      (default 1) and frame_end set the range. Call this FIRST.
+    - "add_media": filepath auto-detects movie (.mp4/.mov/.mkv/.webm), image
+      (.png/.jpg/.exr; still, 96-frame default), image sequence (a directory or
+      a numbered first frame), or audio (.wav/.mp3/.flac/.ogg). channel=None
+      picks the next free channel; fit: FIT|FILL|STRETCH|ORIGINAL. NOTE: movies
+      import VIDEO ONLY - to hear a movie's audio, call add_media again with
+      the same filepath renamed to its audio, or add a separate audio file.
+    - "add_text": text overlay; frame_start, duration (frames), size, color
+      [r,g,b,a], position BOTTOM|CENTER|TOP, optional font_path.
+    - "add_transition": strip_a + strip_b, type CROSS|WIPE, duration frames.
+      Non-overlapping strips: strip_b is auto-shifted back (reported).
+    - "add_fade": strip_name, fade_type IN|OUT|BOTH, duration frames
+      (keyframes opacity, or volume for audio).
+    - "set_strip": strip_name plus any of frame_start (move), end_frame (trim),
+      channel, mute, volume (audio), opacity (visual), speed (>0; adds a SPEED
+      effect and retrims).
+    - "remove_strip": strip_name. "clear": confirm=True removes ALL strips.
+    - "list": timeline state only.
+
+    Every mutating action also returns "timeline" (the list payload:
+    resolution, fps, frame range, duration_seconds, strips <=100) - no
+    follow-up list call needed. Returns JSON.
+    """
+    try:
+        blender = get_blender_connection()
+        params = {"action": action, "preset": preset, "resolution": resolution,
+                  "fps": fps, "frame_start": frame_start, "frame_end": frame_end,
+                  "filepath": filepath, "channel": channel, "name": name,
+                  "fit": fit, "text": text, "duration": duration, "size": size,
+                  "color": color, "position": position, "font_path": font_path,
+                  "strip_a": strip_a, "strip_b": strip_b, "type": type,
+                  "strip_name": strip_name, "fade_type": fade_type, "mute": mute,
+                  "volume": volume, "opacity": opacity, "speed": speed,
+                  "end_frame": end_frame, "confirm": confirm}
+        params = {k: v for k, v in params.items() if v is not None}
+        result = blender.send_command("manage_sequence", params)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error managing sequence: {str(e)}")
+        return f"Error managing sequence: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("render_sequence")
+def render_sequence(
+    ctx: Context,
+    filepath: str = None,
+    preset: str = None,
+    resolution: List[int] = None,
+    fps: float = None,
+    frame_start: int = None,
+    frame_end: int = None,
+    container: str = "MPEG4",
+    video_bitrate: int = None,
+    wait: bool = True,
+    status_only: bool = False,
+    user_prompt: str = ""
+) -> str:
+    """
+    Encode the VSE timeline to a video file (H.264 + AAC via FFMPEG).
+
+    - filepath: output file; the container's extension is appended if missing
+      (MPEG4->.mp4, MKV->.mkv, WEBM->.webm, QUICKTIME->.mov).
+    - preset / resolution / fps: same delivery presets as setup_timeline;
+      omitted values keep the current scene settings.
+    - frame_start / frame_end: encode range (defaults: scene range).
+    - video_bitrate: kbps override (otherwise high-quality CRF).
+    - wait=True (default): renders synchronously and returns {filepath,
+      size_bytes, frames, duration_seconds}. VSE encodes are near-realtime;
+      suitable for clips up to ~90s at 1080p (every command must finish
+      within the 180s socket window).
+    - wait=False: starts a background render job (needs the Blender UI; in
+      headless/background Blender this returns an error - use wait=True).
+      Poll with status_only=True, which returns the job state {active,
+      frame_current, frame_end, filepath, done, cancelled, error}.
+
+    All render settings touched are restored after the encode. Returns JSON.
+    """
+    try:
+        blender = get_blender_connection()
+        params = {"filepath": filepath, "preset": preset, "resolution": resolution,
+                  "fps": fps, "frame_start": frame_start, "frame_end": frame_end,
+                  "container": container, "video_bitrate": video_bitrate,
+                  "wait": wait, "status_only": status_only}
+        params = {k: v for k, v in params.items() if v is not None}
+        result = blender.send_command("render_sequence", params)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error rendering sequence: {str(e)}")
+        return f"Error rendering sequence: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("get_delivery_presets")
+def get_delivery_presets(ctx: Context, user_prompt: str = "") -> str:
+    """
+    List the platform delivery presets for video editing (manage_sequence
+    setup_timeline and render_sequence take these preset names), plus
+    delivery guidance. Static - does not contact Blender.
+
+    Returns JSON {presets: {name: {resolution, fps}}, guidance}.
+    """
+    return json.dumps({
+        "presets": DELIVERY_PRESETS,
+        "guidance": {
+            "platform_fit": "LinkedIn feed favors SQUARE or VERTICAL (more "
+                            "screen area on mobile); LINKEDIN_WIDE suits "
+                            "website embeds and desktop viewing.",
+            "codec": "All presets encode H.264 video + AAC audio (MP4) - the "
+                     "safest combination for social platforms.",
+            "length": "Keep social clips 15-60 seconds.",
+            "workflow": "setup_timeline with the target preset BEFORE placing "
+                        "strips; render each target format as a separate "
+                        "render_sequence call after re-running setup_timeline "
+                        "(strips keep their timing).",
+        },
+    }, indent=2)
+
+@mcp.tool()
 @telemetry_tool("get_session_stats")
 def get_session_stats(ctx: Context, user_prompt: str = "") -> str:
     """
@@ -2376,6 +2539,47 @@ def animation_strategy() -> str:
     Session continuity: keep the assignment record current with manage_assignment
     (read at session start, update as steps land, handoff when done) - see the
     asset_creation_strategy prompt for the full workflow.
+    """
+
+@mcp.prompt()
+def production_strategy() -> str:
+    """Defines the preferred workflow for editing and delivering video in Blender"""
+    return """When assembling and delivering video from Blender (the VSE), follow this workflow:
+
+    1. Format first: call get_delivery_presets(), then manage_sequence
+       action="setup_timeline" with the TARGET preset (LINKEDIN_WIDE / SQUARE /
+       VERTICAL) BEFORE placing any strips, so text and framing are composed for
+       the final aspect ratio. All strip times are FRAMES, not seconds:
+       frame = round(seconds * fps).
+
+    2. Assemble the cut: add shot renders in story order with action="add_media"
+       (movies import video only - audio is a separate add_media call). Let
+       channel default to the next free channel; use set_strip to move/trim.
+
+    3. Cut to the beat: if a beat map JSON exists in the project folder, read it
+       and place cuts and text on beat frames (frame = round(beat_time_seconds *
+       fps)). Align strip starts and transitions with those frames.
+
+    4. Brand it: add text overlays with action="add_text" (BOTTOM for captions,
+       CENTER for title cards). If a video-brand-pack.json exists in the project
+       folder, use its colors and fonts (font_path) for every text strip.
+
+    5. Polish: action="add_transition" (CROSS for soft cuts, WIPE for energy)
+       between adjacent shots - non-overlapping strips are auto-shifted;
+       action="add_fade" (IN on the first strip, OUT on the last, and on audio).
+
+    6. Verify before encoding: keep total clip length 15-60 seconds for social.
+       Check the returned "timeline" state after each edit, and use
+       render_animation_preview() to eyeball frames BEFORE a full encode.
+
+    7. Deliver per platform: render_sequence(filepath, preset=...) for each
+       required format - WIDE / SQUARE / VERTICAL are separate renders: re-run
+       setup_timeline with the next preset (strips keep their timing), then
+       render_sequence again. Use wait=True for clips up to ~90s; longer renders
+       need wait=False plus status_only=True polling (interactive Blender only).
+
+    8. Hand off: manage_project save, then manage_assignment action="handoff"
+       recording delivered files and any remaining formats.
     """
 
 # Main execution

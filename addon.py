@@ -27,14 +27,14 @@ from contextlib import redirect_stdout, suppress
 bl_info = {
     "name": "Blender MCP",
     "author": "BlenderMCP",
-    "version": (1, 7, 1),
+    "version": (1, 8, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > BlenderMCP",
     "description": "Connect Blender to Claude via MCP",
     "category": "Interface",
 }
 
-ADDON_VERSION = "1.7.1"
+ADDON_VERSION = "1.8.0"
 
 RODIN_FREE_TRIAL_KEY = "vibecoding"
 
@@ -124,6 +124,8 @@ MUTATING_COMMANDS = {
     "set_keyframe_interpolation",
     "manage_timeline",
     "import_local_asset",
+    "manage_sequence",
+    "render_sequence",
     # Integration commands that modify the scene
     "download_polyhaven_asset",
     "set_texture",
@@ -148,6 +150,87 @@ CAMERA_PRESETS = {
     "isometric": (1.0, -1.0, 0.8),
     "three_quarter": (1.0, -1.0, 0.35),
 }
+
+# Platform delivery presets for the video sequence editor (VSE).
+# Keep in sync with DELIVERY_PRESETS in src/blender_mcp/server.py.
+DELIVERY_PRESETS = {
+    "LINKEDIN_WIDE": {"resolution": (1920, 1080), "fps": 25},
+    "SQUARE": {"resolution": (1080, 1080), "fps": 25},
+    "VERTICAL": {"resolution": (1080, 1920), "fps": 25},
+}
+
+# Media extensions recognized by manage_sequence add_media
+VSE_MOVIE_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm"}
+VSE_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".exr"}
+VSE_AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg"}
+
+# FFMPEG container -> output file extension (render_sequence)
+VSE_CONTAINER_EXTENSIONS = {
+    "MPEG4": ".mp4",
+    "MKV": ".mkv",
+    "WEBM": ".webm",
+    "QUICKTIME": ".mov",
+}
+
+# Async VSE render job state (written by bpy.app.handlers callbacks below,
+# read by render_sequence(status_only=True)).
+_RENDER_JOB = {
+    "active": False,
+    "frame_current": None,
+    "frame_end": None,
+    "filepath": None,
+    "done": False,
+    "cancelled": False,
+    "error": None,
+    "started_at": None,
+}
+# Render settings snapshot to restore when an async render finishes/cancels
+_RENDER_JOB_RESTORE = {}
+_RENDER_HANDLERS_ADDED = False
+
+
+def _finish_render_job(done=False, cancelled=False):
+    """Mark the async VSE render job finished and restore render settings."""
+    if not _RENDER_JOB.get("active"):
+        return
+    _RENDER_JOB["active"] = False
+    _RENDER_JOB["done"] = bool(done)
+    _RENDER_JOB["cancelled"] = bool(cancelled)
+    snap = dict(_RENDER_JOB_RESTORE)
+    _RENDER_JOB_RESTORE.clear()
+    if snap:
+        try:
+            BlenderMCPServer._restore_vse_render_settings(snap)
+        except Exception:
+            pass
+
+
+@bpy.app.handlers.persistent
+def _mcp_vse_render_post(scene, _depsgraph=None):
+    if _RENDER_JOB.get("active"):
+        with suppress(Exception):
+            _RENDER_JOB["frame_current"] = scene.frame_current
+
+
+@bpy.app.handlers.persistent
+def _mcp_vse_render_complete(scene, _depsgraph=None):
+    _finish_render_job(done=True)
+
+
+@bpy.app.handlers.persistent
+def _mcp_vse_render_cancel(scene, _depsgraph=None):
+    _finish_render_job(cancelled=True)
+
+
+def _ensure_render_handlers():
+    """Register the async render job handlers once per session."""
+    global _RENDER_HANDLERS_ADDED
+    if _RENDER_HANDLERS_ADDED:
+        return
+    bpy.app.handlers.render_post.append(_mcp_vse_render_post)
+    bpy.app.handlers.render_complete.append(_mcp_vse_render_complete)
+    bpy.app.handlers.render_cancel.append(_mcp_vse_render_cancel)
+    _RENDER_HANDLERS_ADDED = True
 
 # Persistent namespace for execute_code REPL semantics (lazily initialized)
 _EXEC_NAMESPACE = None
@@ -640,6 +723,9 @@ class BlenderMCPServer:
             "import_local_asset": self.import_local_asset,
             "manage_project": self.manage_project,
             "manage_assignment": self.manage_assignment,
+            # Video sequence editor (VSE)
+            "manage_sequence": self.manage_sequence,
+            "render_sequence": self.render_sequence,
             # Integration status
             "get_polyhaven_status": self.get_polyhaven_status,
             "get_hyper3d_status": self.get_hyper3d_status,
@@ -2999,6 +3085,800 @@ class BlenderMCPServer:
         if sidecar_error:
             result["sidecar_error"] = sidecar_error
         return result
+
+    # ------------------------------------------------------------------
+    # Video sequence editor (VSE) helpers & handlers
+    # ------------------------------------------------------------------
+    # Blender 5.x renamed the sequencer API (strips/strips_all, Strip types,
+    # new_effect(length=, input1=, input2=), content_start/left_handle/
+    # right_handle/duration). The helpers below feature-detect and fall back
+    # to the 4.x names (sequences/sequences_all, frame_final_*, frame_end=,
+    # seq1=/seq2=) so both generations keep working.
+
+    @staticmethod
+    def _get_sequence_editor():
+        """Return the scene's sequence editor, creating it on first use."""
+        scene = bpy.context.scene
+        if scene.sequence_editor is None:
+            scene.sequence_editor_create()
+        return scene.sequence_editor
+
+    @staticmethod
+    def _seq_collection(se):
+        """Top-level strip collection: 'strips' (5.x) or 'sequences' (4.x)"""
+        col = getattr(se, "strips", None)
+        if col is None:
+            col = getattr(se, "sequences", None)
+        if col is None:
+            raise RuntimeError("This Blender build exposes no sequencer strip collection.")
+        return col
+
+    @classmethod
+    def _seq_all(cls, se):
+        """All strips including inside metas: 'strips_all' (5.x) / 'sequences_all' (4.x)"""
+        col = getattr(se, "strips_all", None)
+        if col is None:
+            col = getattr(se, "sequences_all", None)
+        return col if col is not None else cls._seq_collection(se)
+
+    def _find_strip(self, name):
+        """Find a strip by name or raise with guidance"""
+        se = self._get_sequence_editor()
+        strip = self._seq_all(se).get(str(name))
+        if strip is None:
+            existing = ", ".join(s.name for s in list(self._seq_all(se))[:20]) or "(none)"
+            raise ValueError(
+                f"Strip '{name}' not found. Existing strips: {existing}. "
+                f"Use manage_sequence action 'list' to inspect the timeline."
+            )
+        return strip
+
+    @staticmethod
+    def _strip_final_start(strip):
+        """First shown frame (left_handle on 5.x, frame_final_start on 4.x)"""
+        if hasattr(strip, "left_handle"):
+            return int(strip.left_handle)
+        return int(strip.frame_final_start)
+
+    @staticmethod
+    def _strip_final_end(strip):
+        """End frame, exclusive (right_handle on 5.x, frame_final_end on 4.x)"""
+        if hasattr(strip, "right_handle"):
+            return int(strip.right_handle)
+        return int(strip.frame_final_end)
+
+    @staticmethod
+    def _strip_duration(strip):
+        if hasattr(strip, "duration"):
+            return int(strip.duration)
+        return int(strip.frame_final_duration)
+
+    @staticmethod
+    def _set_strip_duration(strip, duration):
+        duration = max(1, int(duration))
+        if hasattr(strip, "duration"):
+            strip.duration = duration
+        else:
+            strip.frame_final_duration = duration
+
+    @classmethod
+    def _move_strip_to(cls, strip, frame_start):
+        """Move a whole strip so its first shown frame lands on frame_start"""
+        delta = int(frame_start) - cls._strip_final_start(strip)
+        if not delta:
+            return
+        if hasattr(strip, "content_start"):
+            strip.content_start = strip.content_start + delta
+        else:
+            strip.frame_start = strip.frame_start + delta
+
+    def _next_free_channel(self, se, frame_start, frame_end, exclude=None, minimum=1):
+        """Lowest channel with no strip overlapping [frame_start, frame_end)"""
+        used = set()
+        for s in self._seq_collection(se):
+            if exclude is not None and s.name == getattr(exclude, "name", None):
+                continue
+            if self._strip_final_end(s) <= frame_start or self._strip_final_start(s) >= frame_end:
+                continue
+            used.add(int(s.channel))
+        channel = max(1, int(minimum))
+        while channel in used and channel < 128:
+            channel += 1
+        return channel
+
+    def _place_strip_on_channel(self, se, strip, channel):
+        """Assign a strip's channel: explicit value, or the lowest free channel"""
+        start, end = self._strip_final_start(strip), self._strip_final_end(strip)
+        if channel is None:
+            channel = self._next_free_channel(se, start, end, exclude=strip)
+        strip.channel = max(1, min(int(channel), 128))
+        return int(strip.channel)
+
+    def _strip_summary(self, strip):
+        """Serializable summary of one strip (for list())"""
+        stype = str(getattr(strip, "type", ""))
+        entry = {
+            "name": strip.name,
+            "type": stype,
+            "channel": int(strip.channel),
+            "frame_start": self._strip_final_start(strip),
+            "frame_final_end": self._strip_final_end(strip),
+            "mute": bool(getattr(strip, "mute", False)),
+            "has_audio": stype == 'SOUND',
+        }
+        filepath = None
+        if stype == 'MOVIE':
+            filepath = getattr(strip, "filepath", None)
+        elif stype == 'IMAGE':
+            try:
+                elems = strip.elements
+                filepath = os.path.join(strip.directory, elems[0].filename) if len(elems) \
+                    else strip.directory
+            except Exception:
+                filepath = getattr(strip, "directory", None)
+        elif stype == 'SOUND':
+            with suppress(Exception):
+                filepath = strip.sound.filepath
+        if stype == 'TEXT':
+            entry["text"] = str(getattr(strip, "text", ""))[:200]
+        elif filepath:
+            entry["filepath"] = str(filepath)
+        return entry
+
+    def _sequence_state(self):
+        """Full timeline state: the manage_sequence 'list' payload"""
+        scene = bpy.context.scene
+        se = self._get_sequence_editor()
+        strips = sorted(
+            self._seq_collection(se),
+            key=lambda s: (int(s.channel), self._strip_final_start(s)),
+        )
+        timeline = self._timeline_status()
+        return {
+            "resolution": [scene.render.resolution_x, scene.render.resolution_y],
+            "fps": timeline["fps"],
+            "frame_start": timeline["frame_start"],
+            "frame_end": timeline["frame_end"],
+            "duration_seconds": timeline["duration_seconds"],
+            "strips": [self._strip_summary(s) for s in strips[:100]],
+            "total_strips": len(strips),
+        }
+
+    @staticmethod
+    def _resolve_delivery(preset=None, resolution=None, fps=None):
+        """Resolve preset/explicit overrides to (resolution|None, fps|None)"""
+        res, fps_val = None, None
+        if preset is not None:
+            key = str(preset).upper()
+            if key not in DELIVERY_PRESETS:
+                raise ValueError(
+                    f"Unknown preset '{preset}'. Valid presets: "
+                    f"{', '.join(sorted(DELIVERY_PRESETS))}."
+                )
+            entry = DELIVERY_PRESETS[key]
+            res, fps_val = list(entry["resolution"]), entry["fps"]
+        if resolution is not None:
+            if not isinstance(resolution, (list, tuple)) or len(resolution) != 2:
+                raise ValueError("resolution must be [width, height].")
+            res = [int(resolution[0]), int(resolution[1])]
+        if fps is not None:
+            fps_val = float(fps)
+        return res, fps_val
+
+    @staticmethod
+    def _apply_delivery(res, fps_val):
+        scene = bpy.context.scene
+        if res is not None:
+            scene.render.resolution_x = int(res[0])
+            scene.render.resolution_y = int(res[1])
+            scene.render.resolution_percentage = 100
+        if fps_val is not None:
+            scene.render.fps = int(round(float(fps_val)))
+            scene.render.fps_base = 1.0
+
+    @staticmethod
+    def _new_effect_strip(col, name, effect_type, channel, frame_start, length,
+                          input1=None, input2=None):
+        """new_effect across API generations: 5.x length/input1/input2, 4.x frame_end/seq1/seq2"""
+        length = max(1, int(length))
+        kwargs = {"name": name, "type": effect_type, "channel": int(channel),
+                  "frame_start": int(frame_start), "length": length}
+        if input1 is not None:
+            kwargs["input1"] = input1
+        if input2 is not None:
+            kwargs["input2"] = input2
+        try:
+            return col.new_effect(**kwargs)
+        except TypeError:
+            kwargs = {"name": name, "type": effect_type, "channel": int(channel),
+                      "frame_start": int(frame_start),
+                      "frame_end": int(frame_start) + length}
+            if input1 is not None:
+                kwargs["seq1"] = input1
+            if input2 is not None:
+                kwargs["seq2"] = input2
+            return col.new_effect(**kwargs)
+
+    @staticmethod
+    def _collect_image_sequence(filepath):
+        """Image-sequence detection: a directory, or a numbered first frame with siblings.
+
+        Returns (directory, [filenames]) for a sequence, or None for a single still.
+        """
+        if os.path.isdir(filepath):
+            files = sorted(
+                f for f in os.listdir(filepath)
+                if os.path.splitext(f)[1].lower() in VSE_IMAGE_EXTENSIONS
+            )
+            if not files:
+                raise ValueError(f"Directory '{filepath}' contains no image files.")
+            return filepath, files
+        if os.path.splitext(filepath)[1].lower() not in VSE_IMAGE_EXTENSIONS:
+            return None
+        directory, filename = os.path.split(filepath)
+        m = re.match(r"^(.*?)(\d+)(\.[A-Za-z0-9]+)$", filename)
+        if not m:
+            return None
+        prefix, _, ext = m.group(1), m.group(2), m.group(3)
+        pattern = re.compile(
+            r"^" + re.escape(prefix) + r"(\d+)" + re.escape(ext) + r"$", re.IGNORECASE
+        )
+        siblings = []
+        with suppress(Exception):
+            for f in os.listdir(directory or "."):
+                mm = pattern.match(f)
+                if mm:
+                    siblings.append((int(mm.group(1)), f))
+        if len(siblings) < 2:
+            return None
+        siblings.sort()
+        return directory, [f for _, f in siblings]
+
+    def _vse_setup_timeline(self, preset, resolution, fps, frame_start, frame_end):
+        scene = bpy.context.scene
+        self._get_sequence_editor()
+        res, fps_val = self._resolve_delivery(preset, resolution, fps)
+        self._apply_delivery(res, fps_val)
+        scene.frame_start = int(frame_start if frame_start is not None else 1)
+        if frame_end is not None:
+            scene.frame_end = int(frame_end)
+        return {"action": "setup_timeline",
+                "preset": str(preset).upper() if preset else None}
+
+    def _vse_add_media(self, filepath, channel, frame_start, name, fit):
+        if not filepath:
+            raise ValueError(
+                "add_media requires filepath (a movie/image/audio file, an image "
+                "directory, or the first frame of a numbered image sequence)."
+            )
+        fit = str(fit or "FIT").upper()
+        if fit not in ("FIT", "FILL", "STRETCH", "ORIGINAL"):
+            raise ValueError(f"Invalid fit '{fit}'. Use FIT, FILL, STRETCH or ORIGINAL.")
+        filepath = os.path.abspath(bpy.path.abspath(str(filepath)))
+        if not os.path.exists(filepath):
+            raise ValueError(f"File not found: {filepath}")
+        frame_start = int(frame_start if frame_start is not None else 1)
+
+        se = self._get_sequence_editor()
+        col = self._seq_collection(se)
+        ext = os.path.splitext(filepath)[1].lower()
+        # Create on a guaranteed-free scratch channel; relocate once the
+        # final frame range is known (movie/audio lengths come from the file).
+        scratch = min(128, max((int(s.channel) for s in col), default=0) + 1)
+        base_name = name or os.path.splitext(os.path.basename(filepath))[0]
+
+        def _new_visual(factory, **kwargs):
+            try:
+                return factory(fit_method=fit, **kwargs)
+            except TypeError:
+                return factory(**kwargs)  # very old Blender: no fit_method
+
+        sequence = None if ext in (VSE_MOVIE_EXTENSIONS | VSE_AUDIO_EXTENSIONS) \
+            else self._collect_image_sequence(filepath)
+        if ext in VSE_MOVIE_EXTENSIONS:
+            media_type = "movie"
+            strip = _new_visual(col.new_movie, name=base_name, filepath=filepath,
+                                channel=scratch, frame_start=frame_start)
+        elif ext in VSE_AUDIO_EXTENSIONS:
+            media_type = "audio"
+            strip = col.new_sound(name=base_name, filepath=filepath,
+                                  channel=scratch, frame_start=frame_start)
+        elif sequence is not None:
+            media_type = "image_sequence"
+            directory, files = sequence
+            strip = _new_visual(col.new_image, name=base_name,
+                                filepath=os.path.join(directory, files[0]),
+                                channel=scratch, frame_start=frame_start)
+            for extra in files[1:]:
+                strip.elements.append(extra)
+            self._set_strip_duration(strip, len(files))
+        elif ext in VSE_IMAGE_EXTENSIONS:
+            media_type = "image"
+            strip = _new_visual(col.new_image, name=base_name, filepath=filepath,
+                                channel=scratch, frame_start=frame_start)
+            self._set_strip_duration(strip, 96)  # default still duration
+        else:
+            raise ValueError(
+                f"Unsupported extension '{ext}'. Movies: "
+                f"{', '.join(sorted(VSE_MOVIE_EXTENSIONS))}; images: "
+                f"{', '.join(sorted(VSE_IMAGE_EXTENSIONS))}; audio: "
+                f"{', '.join(sorted(VSE_AUDIO_EXTENSIONS))}."
+            )
+
+        self._place_strip_on_channel(se, strip, channel)
+        return {"action": "add_media", "media_type": media_type,
+                "strip": self._strip_summary(strip)}
+
+    def _vse_add_text(self, text, frame_start, duration, channel, size, color,
+                      position, font_path, name):
+        if not text:
+            raise ValueError("add_text requires text.")
+        position = str(position or "BOTTOM").upper()
+        positions = {"BOTTOM": 0.12, "CENTER": 0.5, "TOP": 0.85}
+        if position not in positions:
+            raise ValueError(f"Invalid position '{position}'. Use BOTTOM, CENTER or TOP.")
+        frame_start = int(frame_start if frame_start is not None else 1)
+        duration = max(1, int(duration if duration is not None else 96))
+
+        se = self._get_sequence_editor()
+        col = self._seq_collection(se)
+        if channel is None:
+            channel = self._next_free_channel(se, frame_start, frame_start + duration)
+        strip = self._new_effect_strip(
+            col, name or "Text", 'TEXT', channel, frame_start, duration)
+        strip.text = str(text)
+        with suppress(Exception):
+            strip.font_size = float(size if size is not None else 64)
+        if color is not None:
+            col4 = list(color) + [1.0] * (4 - len(list(color)))
+            with suppress(Exception):
+                strip.color = col4[:4]
+        if hasattr(strip, "location"):
+            strip.location = (0.5, positions[position])
+        with suppress(Exception):
+            strip.anchor_x = 'CENTER'
+            strip.anchor_y = position
+        if hasattr(strip, "use_shadow"):
+            strip.use_shadow = True  # legibility over any footage
+        warning = None
+        if font_path:
+            try:
+                strip.font = bpy.data.fonts.load(
+                    os.path.abspath(bpy.path.abspath(str(font_path))),
+                    check_existing=True)
+            except Exception as e:
+                warning = f"Could not load font '{font_path}': {e}"
+        result = {"action": "add_text", "strip": self._strip_summary(strip)}
+        if warning:
+            result["warning"] = warning
+        return result
+
+    def _vse_add_transition(self, strip_a, strip_b, transition_type, duration):
+        if not strip_a or not strip_b:
+            raise ValueError("add_transition requires strip_a and strip_b (strip names).")
+        ttype = str(transition_type or "CROSS").upper()
+        if ttype not in ("CROSS", "WIPE", "GAMMA_CROSS"):
+            raise ValueError(f"Invalid transition type '{ttype}'. Use CROSS or WIPE.")
+        duration = max(2, int(duration if duration is not None else 12))
+        a = self._find_strip(strip_a)
+        b = self._find_strip(strip_b)
+        if a.name == b.name:
+            raise ValueError("strip_a and strip_b must be different strips.")
+        # a = the earlier strip
+        if self._strip_final_start(b) < self._strip_final_start(a):
+            a, b = b, a
+
+        se = self._get_sequence_editor()
+        col = self._seq_collection(se)
+        overlap = self._strip_final_end(a) - self._strip_final_start(b)
+        shifted_by = 0
+        if overlap < duration:
+            # Shift b back so the strips overlap by exactly `duration` frames
+            # (covers both a gap and a too-small overlap).
+            shifted_by = duration - overlap
+            self._move_strip_to(b, self._strip_final_start(b) - shifted_by)
+        start = self._strip_final_start(b)
+        length = min(duration, self._strip_final_end(a) - start)
+        channel = self._next_free_channel(
+            se, start, start + length, minimum=max(int(a.channel), int(b.channel)) + 1)
+        fx = self._new_effect_strip(
+            col, f"{ttype}_{a.name}_{b.name}"[:60], ttype, channel, start, length,
+            input1=a, input2=b)
+        result = {
+            "action": "add_transition",
+            "transition": self._strip_summary(fx),
+            "type": ttype,
+            "strip_a": a.name,
+            "strip_b": b.name,
+        }
+        if shifted_by:
+            result["shifted"] = {
+                "strip": b.name,
+                "moved_back_frames": shifted_by,
+                "reason": "strips did not overlap; strip_b was shifted back to "
+                          "create the transition overlap",
+            }
+        return result
+
+    def _vse_add_fade(self, strip_name, fade_type, duration):
+        if not strip_name:
+            raise ValueError("add_fade requires strip_name.")
+        fade_type = str(fade_type or "IN").upper()
+        if fade_type not in ("IN", "OUT", "BOTH"):
+            raise ValueError(f"Invalid fade_type '{fade_type}'. Use IN, OUT or BOTH.")
+        duration = max(1, int(duration if duration is not None else 12))
+        strip = self._find_strip(strip_name)
+        prop = "volume" if strip.type == 'SOUND' else "blend_alpha"
+        if not hasattr(strip, prop):
+            raise ValueError(
+                f"Strip '{strip.name}' (type {strip.type}) supports no fade property.")
+        full = float(getattr(strip, prop)) or 1.0
+        start = self._strip_final_start(strip)
+        end = self._strip_final_end(strip)
+        duration = min(duration, max(1, end - start))
+
+        def _key(frame, value):
+            setattr(strip, prop, value)
+            strip.keyframe_insert(prop, frame=int(frame))
+
+        frames = []
+        if fade_type in ("IN", "BOTH"):
+            _key(start, 0.0)
+            _key(min(start + duration, end), full)
+            frames += [start, min(start + duration, end)]
+        if fade_type in ("OUT", "BOTH"):
+            _key(max(end - duration, start), full)
+            _key(end, 0.0)
+            frames += [max(end - duration, start), end]
+        return {"action": "add_fade", "strip": strip.name, "property": prop,
+                "fade_type": fade_type, "keyframed_frames": frames}
+
+    def _vse_set_strip(self, strip_name, frame_start, channel, mute, volume,
+                       opacity, speed, end_frame):
+        if not strip_name:
+            raise ValueError("set_strip requires strip_name.")
+        strip = self._find_strip(strip_name)
+        se = self._get_sequence_editor()
+        changed = []
+        if frame_start is not None:
+            self._move_strip_to(strip, int(frame_start))
+            changed.append("frame_start")
+        if end_frame is not None:
+            if int(end_frame) <= self._strip_final_start(strip):
+                raise ValueError("end_frame must be greater than the strip's start frame.")
+            if hasattr(strip, "right_handle"):
+                strip.right_handle = int(end_frame)
+            else:
+                strip.frame_final_end = int(end_frame)
+            changed.append("end_frame")
+        if channel is not None:
+            strip.channel = max(1, min(int(channel), 128))
+            changed.append("channel")
+        if mute is not None:
+            strip.mute = bool(mute)
+            changed.append("mute")
+        if volume is not None:
+            if not hasattr(strip, "volume"):
+                raise ValueError(
+                    f"Strip '{strip.name}' (type {strip.type}) has no volume; "
+                    f"volume only applies to SOUND strips.")
+            strip.volume = float(volume)
+            changed.append("volume")
+        if opacity is not None:
+            if not hasattr(strip, "blend_alpha"):
+                raise ValueError(
+                    f"Strip '{strip.name}' (type {strip.type}) has no opacity; "
+                    f"opacity only applies to visual strips.")
+            strip.blend_alpha = max(0.0, min(float(opacity), 1.0))
+            changed.append("opacity")
+        speed_info = None
+        if speed is not None:
+            speed = float(speed)
+            if speed <= 0:
+                raise ValueError("speed must be > 0 (e.g. 2.0 = twice as fast).")
+            if strip.type == 'SOUND':
+                raise ValueError(
+                    "speed applies to visual strips only (SOUND strips cannot take "
+                    "a SPEED effect). Re-add the audio trimmed to length instead.")
+            col = self._seq_collection(se)
+            original = self._strip_duration(strip)
+            start = self._strip_final_start(strip)
+            fx = self._new_effect_strip(
+                col, f"Speed_{strip.name}"[:60], 'SPEED',
+                self._next_free_channel(se, start, start + original,
+                                        minimum=int(strip.channel) + 1),
+                start, original, input1=strip)
+            if hasattr(fx, "speed_control"):
+                fx.speed_control = 'MULTIPLY'
+                fx.speed_factor = speed
+            elif hasattr(fx, "speed_factor"):
+                fx.speed_factor = speed
+            else:
+                col.remove(fx)
+                return {
+                    "error": "This Blender build exposes no usable speed control "
+                             "(no speed_control/speed_factor on the SPEED effect). "
+                             "Retime the source clip externally instead."
+                }
+            new_duration = max(1, int(round(original / speed)))
+            self._set_strip_duration(strip, new_duration)
+            speed_info = {"effect": fx.name, "factor": speed,
+                          "original_frames": original, "new_frames": new_duration}
+            changed.append("speed")
+        if not changed:
+            raise ValueError(
+                "set_strip: provide at least one of frame_start, channel, mute, "
+                "volume, opacity, speed, end_frame.")
+        result = {"action": "set_strip", "strip": self._strip_summary(strip),
+                  "changed": changed}
+        if speed_info:
+            result["speed"] = speed_info
+        return result
+
+    def _vse_remove_strip(self, strip_name):
+        if not strip_name:
+            raise ValueError("remove_strip requires strip_name.")
+        strip = self._find_strip(strip_name)
+        removed = strip.name
+        self._seq_collection(self._get_sequence_editor()).remove(strip)
+        return {"action": "remove_strip", "removed": removed}
+
+    def _vse_clear(self, confirm):
+        if confirm is not True:
+            raise ValueError(
+                "clear removes ALL strips from the timeline; call again with "
+                "confirm=true to proceed.")
+        se = self._get_sequence_editor()
+        col = self._seq_collection(se)
+        removed = 0
+        # Removing a strip may cascade-remove dependent effect strips, so
+        # re-fetch from the live collection each pass instead of iterating.
+        guard = 0
+        while len(col) and guard < 1024:
+            with suppress(Exception):
+                col.remove(col[0])
+            removed += 1
+            guard += 1
+        return {"action": "clear", "removed_strips": removed}
+
+    def manage_sequence(self, action, preset=None, resolution=None, fps=None,
+                        frame_start=None, frame_end=None, filepath=None,
+                        channel=None, name=None, fit="FIT", text=None,
+                        duration=None, size=64, color=None, position="BOTTOM",
+                        font_path=None, strip_a=None, strip_b=None, type=None,
+                        strip_name=None, fade_type="IN", mute=None, volume=None,
+                        opacity=None, speed=None, end_frame=None, confirm=False):
+        """Composite video-sequence-editor handler (see server tool docstring)"""
+        action = str(action).lower()
+        if action == "list":
+            return self._sequence_state()
+        if action == "setup_timeline":
+            result = self._vse_setup_timeline(preset, resolution, fps, frame_start, frame_end)
+        elif action == "add_media":
+            result = self._vse_add_media(filepath, channel, frame_start, name, fit)
+        elif action == "add_text":
+            result = self._vse_add_text(text, frame_start, duration, channel, size,
+                                        color, position, font_path, name)
+        elif action == "add_transition":
+            result = self._vse_add_transition(strip_a, strip_b, type, duration)
+        elif action == "add_fade":
+            result = self._vse_add_fade(strip_name, fade_type, duration)
+        elif action == "set_strip":
+            result = self._vse_set_strip(strip_name, frame_start, channel, mute,
+                                         volume, opacity, speed, end_frame)
+        elif action == "remove_strip":
+            result = self._vse_remove_strip(strip_name)
+        elif action == "clear":
+            result = self._vse_clear(confirm)
+        else:
+            raise ValueError(
+                f"Unknown action '{action}'. Use setup_timeline, add_media, add_text, "
+                f"add_transition, add_fade, set_strip, remove_strip, clear or list."
+            )
+        if "error" not in result:
+            # Every mutating action returns the post-state so the agent never
+            # needs a follow-up list() round-trip.
+            result["timeline"] = self._sequence_state()
+        return result
+
+    @staticmethod
+    def _snapshot_vse_render_settings():
+        """Capture every setting render_sequence may touch"""
+        scene = bpy.context.scene
+        render = scene.render
+        snap = {
+            "resolution_x": render.resolution_x,
+            "resolution_y": render.resolution_y,
+            "resolution_percentage": render.resolution_percentage,
+            "filepath": render.filepath,
+            "fps": render.fps,
+            "fps_base": render.fps_base,
+            "frame_start": scene.frame_start,
+            "frame_end": scene.frame_end,
+            "frame_current": scene.frame_current,
+            "file_format": render.image_settings.file_format,
+            "use_sequencer": getattr(render, "use_sequencer", None),
+        }
+        if hasattr(render.image_settings, "media_type"):
+            snap["media_type"] = render.image_settings.media_type
+        with suppress(Exception):
+            ff = render.ffmpeg
+            snap["ffmpeg"] = {
+                "format": ff.format,
+                "codec": ff.codec,
+                "audio_codec": ff.audio_codec,
+                "constant_rate_factor": ff.constant_rate_factor,
+                "video_bitrate": ff.video_bitrate,
+                "gopsize": ff.gopsize,
+            }
+        return snap
+
+    @staticmethod
+    def _restore_vse_render_settings(snap):
+        """Restore settings captured by _snapshot_vse_render_settings (best effort)"""
+        scene = bpy.context.scene
+        render = scene.render
+        # media_type gates the file_format enum on 5.x: restore it first
+        if "media_type" in snap:
+            with suppress(Exception):
+                render.image_settings.media_type = snap["media_type"]
+        with suppress(Exception):
+            render.image_settings.file_format = snap["file_format"]
+        ff_snap = snap.get("ffmpeg") or {}
+        for key, value in ff_snap.items():
+            with suppress(Exception):
+                setattr(render.ffmpeg, key, value)
+        for key in ("resolution_x", "resolution_y", "resolution_percentage",
+                    "filepath", "fps", "fps_base"):
+            with suppress(Exception):
+                setattr(render, key, snap[key])
+        if snap.get("use_sequencer") is not None:
+            with suppress(Exception):
+                render.use_sequencer = snap["use_sequencer"]
+        with suppress(Exception):
+            scene.frame_start = snap["frame_start"]
+            scene.frame_end = snap["frame_end"]
+        with suppress(Exception):
+            if scene.frame_current != snap["frame_current"]:
+                scene.frame_set(snap["frame_current"])
+
+    def render_sequence(self, filepath=None, preset=None, resolution=None, fps=None,
+                        frame_start=None, frame_end=None, container="MPEG4",
+                        video_bitrate=None, wait=True, status_only=False):
+        """Encode the sequencer timeline to a video file (see server tool docstring)"""
+        if status_only:
+            job = dict(_RENDER_JOB)
+            if job.get("started_at"):
+                job["elapsed_seconds"] = round(time.time() - job["started_at"], 1)
+            return job
+
+        if not filepath:
+            raise ValueError("filepath is required (e.g. 'C:/renders/clip.mp4').")
+        container = str(container).upper()
+        if container not in VSE_CONTAINER_EXTENSIONS:
+            raise ValueError(
+                f"Unknown container '{container}'. Use one of: "
+                f"{', '.join(sorted(VSE_CONTAINER_EXTENSIONS))}."
+            )
+        expected_ext = VSE_CONTAINER_EXTENSIONS[container]
+        filepath = os.path.abspath(bpy.path.abspath(str(filepath)))
+        if not filepath.lower().endswith(expected_ext):
+            filepath += expected_ext
+        parent = os.path.dirname(filepath)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        if not wait and bpy.app.background:
+            raise ValueError(
+                "wait=False needs Blender's interactive event loop and cannot work "
+                "in background (headless) mode. Call again with wait=True."
+            )
+        if not wait and _RENDER_JOB.get("active"):
+            raise ValueError(
+                "A render job is already active. Poll with status_only=true, or "
+                "wait for it to finish."
+            )
+
+        scene = bpy.context.scene
+        self._get_sequence_editor()
+        res, fps_val = self._resolve_delivery(preset, resolution, fps)
+
+        snap = self._snapshot_vse_render_settings()
+        restore_in_finally = True
+        try:
+            render = scene.render
+            self._apply_delivery(res, fps_val)
+            if frame_start is not None:
+                scene.frame_start = int(frame_start)
+            if frame_end is not None:
+                scene.frame_end = int(frame_end)
+            if hasattr(render.image_settings, "media_type"):
+                render.image_settings.media_type = 'VIDEO'  # 5.x gates FFMPEG on this
+            render.image_settings.file_format = 'FFMPEG'
+            ff = render.ffmpeg
+            ff.format = container
+            if container == "WEBM":
+                codecs, audio_codecs = ("WEBM", "VP9", "AV1"), ("OPUS", "VORBIS")
+            else:
+                codecs, audio_codecs = ("H264",), ("AAC",)
+            for codec in codecs:
+                with suppress(Exception):
+                    ff.codec = codec
+                    break
+            for audio_codec in audio_codecs:
+                with suppress(Exception):
+                    ff.audio_codec = audio_codec
+                    break
+            if video_bitrate is not None:
+                with suppress(Exception):
+                    ff.constant_rate_factor = 'NONE'
+                ff.video_bitrate = int(video_bitrate)
+            else:
+                with suppress(Exception):
+                    ff.constant_rate_factor = 'HIGH'
+            if hasattr(render, "use_sequencer"):
+                render.use_sequencer = True
+            render.filepath = filepath
+
+            frames = scene.frame_end - scene.frame_start + 1
+            try:
+                fps_eff = render.fps / render.fps_base
+            except Exception:
+                fps_eff = float(render.fps)
+
+            if wait:
+                bpy.ops.render.render(animation=True, write_still=False)
+                actual = filepath
+                if not os.path.exists(actual):
+                    import glob as _glob
+                    candidates = sorted(_glob.glob(filepath + "*")) + sorted(
+                        _glob.glob(os.path.splitext(filepath)[0] + "*" + expected_ext))
+                    actual = candidates[0] if candidates else None
+                if not actual or not os.path.exists(actual):
+                    return {"error": f"Render finished but no output file was found at "
+                                     f"'{filepath}'. Check the filepath is writable."}
+                return {
+                    "filepath": actual,
+                    "size_bytes": os.path.getsize(actual),
+                    "frames": frames,
+                    "duration_seconds": round(frames / fps_eff, 3) if fps_eff else None,
+                    "fps": round(fps_eff, 4),
+                    "resolution": [render.resolution_x, render.resolution_y],
+                    "container": container,
+                }
+
+            # Async job: restore happens in the render_complete/cancel handlers
+            _ensure_render_handlers()
+            _RENDER_JOB.update({
+                "active": True,
+                "frame_current": scene.frame_start,
+                "frame_end": scene.frame_end,
+                "filepath": filepath,
+                "done": False,
+                "cancelled": False,
+                "error": None,
+                "started_at": time.time(),
+            })
+            _RENDER_JOB_RESTORE.clear()
+            _RENDER_JOB_RESTORE.update(snap)
+            restore_in_finally = False
+            try:
+                bpy.ops.render.render('INVOKE_DEFAULT', animation=True)
+            except Exception as e:
+                _RENDER_JOB["active"] = False
+                _RENDER_JOB["error"] = str(e)
+                _RENDER_JOB_RESTORE.clear()
+                restore_in_finally = True
+                raise
+            return {
+                "job_started": True,
+                "filepath": filepath,
+                "frames": frames,
+                "poll": "Call render_sequence with status_only=true to track progress.",
+            }
+        finally:
+            if restore_in_finally:
+                self._restore_vse_render_settings(snap)
 
     def get_polyhaven_categories(self, asset_type):
         """Get categories for a specific asset type from Polyhaven"""

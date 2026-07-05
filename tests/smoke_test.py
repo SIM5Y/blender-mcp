@@ -422,6 +422,149 @@ def main():
           and r.get("sidecar_path"),
           str(r)[:300])
 
+    # --- video sequence editor (VSE) ---------------------------------------
+    check("DELIVERY_PRESETS constant",
+          isinstance(getattr(mod, "DELIVERY_PRESETS", None), dict)
+          and set(mod.DELIVERY_PRESETS) == {"LINKEDIN_WIDE", "SQUARE", "VERTICAL"},
+          str(getattr(mod, "DELIVERY_PRESETS", None)))
+
+    r = run("manage_sequence", action="setup_timeline", preset="SQUARE",
+            frame_start=1, frame_end=48)
+    scn = bpy.context.scene
+    check("vse setup_timeline SQUARE",
+          scn.render.resolution_x == 1080 and scn.render.resolution_y == 1080
+          and scn.render.fps == 25 and r.get("timeline", {}).get("fps") == 25,
+          f"res={scn.render.resolution_x}x{scn.render.resolution_y} "
+          f"fps={scn.render.fps} r={str(r)[:200]}")
+
+    # Two tiny PNGs (deliberately un-numbered names: single stills, not a sequence)
+    png_a = os.path.join(tmpdir, "vse_shot_a.png")
+    png_b = os.path.join(tmpdir, "vse_shot_b.png")
+    img = bpy.data.images.new("vse_smoke_img", 64, 64)
+    img.pixels[:] = [0.8, 0.2, 0.2, 1.0] * (64 * 64)
+    img.filepath_raw = png_a
+    img.file_format = 'PNG'
+    img.save()
+    img.pixels[:] = [0.2, 0.2, 0.8, 1.0] * (64 * 64)
+    img.filepath_raw = png_b
+    img.save()
+
+    r = run("manage_sequence", action="add_media", filepath=png_a, frame_start=1)
+    strip_a = (r.get("strip") or {})
+    check("vse add_media image A",
+          r.get("media_type") == "image" and strip_a.get("type") == "IMAGE"
+          and strip_a.get("frame_start") == 1
+          and strip_a.get("frame_final_end") == 97,  # 96-frame default still
+          str(r)[:300])
+
+    r = run("manage_sequence", action="add_media", filepath=png_b,
+            frame_start=120, channel=2)
+    strip_b = (r.get("strip") or {})
+    check("vse add_media image B",
+          strip_b.get("channel") == 2 and strip_b.get("frame_start") == 120,
+          str(r)[:300])
+    check("vse add_media auto channel",
+          strip_a.get("channel") == 1, f"channel={strip_a.get('channel')}")
+
+    r = run("manage_sequence", action="add_text", text="Smoke Title",
+            frame_start=5, duration=40, position="BOTTOM")
+    txt = (r.get("strip") or {})
+    check("vse add_text",
+          txt.get("type") == "TEXT" and txt.get("frame_start") == 5
+          and txt.get("frame_final_end") == 45 and txt.get("text") == "Smoke Title",
+          str(r)[:300])
+
+    # A (1..97) and B (120..216) don't overlap: expect an auto-shift report
+    r = run("manage_sequence", action="add_transition",
+            strip_a=strip_a.get("name"), strip_b=strip_b.get("name"),
+            type="CROSS", duration=12)
+    shifted = r.get("shifted") or {}
+    check("vse add_transition auto-shift",
+          shifted.get("strip") == strip_b.get("name")
+          and shifted.get("moved_back_frames") == 35  # 120 -> 85 (97 - 12)
+          and (r.get("transition") or {}).get("type") in ("CROSS",),
+          str(r)[:400])
+
+    r = run("manage_sequence", action="add_fade",
+            strip_name=strip_a.get("name"), fade_type="IN", duration=10)
+    check("vse add_fade result",
+          r.get("property") == "blend_alpha" and r.get("fade_type") == "IN",
+          str(r)[:300])
+    fade_fcurve = None
+    anim = bpy.context.scene.animation_data
+    action = anim.action if anim else None
+    for fc in mod.BlenderMCPServer._action_fcurves(action):
+        if "blend_alpha" in fc.data_path and strip_a.get("name", "?") in fc.data_path:
+            fade_fcurve = fc
+            break
+    check("vse add_fade fcurve",
+          fade_fcurve is not None and len(fade_fcurve.keyframe_points) >= 2,
+          f"fcurves={[f.data_path for f in mod.BlenderMCPServer._action_fcurves(action)]}")
+
+    r = run("manage_sequence", action="set_strip",
+            strip_name=strip_b.get("name"), frame_start=100, channel=3)
+    listed = {s.get("name"): s for s in (r.get("timeline") or {}).get("strips", [])}
+    moved = listed.get(strip_b.get("name"), {})
+    check("vse set_strip move",
+          moved.get("frame_start") == 100 and moved.get("channel") == 3,
+          str(moved))
+
+    r = run("manage_sequence", action="list")
+    check("vse list",
+          r.get("resolution") == [1080, 1080] and r.get("fps") == 25
+          and r.get("total_strips", 0) >= 4
+          and isinstance(r.get("strips"), list)
+          and r.get("duration_seconds") == round(48 / 25, 4),
+          str({k: v for k, v in r.items() if k != 'strips'}))
+
+    # --- render_sequence: real FFMPEG encode over 12 frames ------------------
+    mp4_path = os.path.join(tmpdir, "vse_smoke.mp4")
+    r = run("render_sequence", filepath=mp4_path, resolution=[320, 320],
+            frame_start=1, frame_end=12, wait=True)
+    check("render_sequence mp4",
+          r.get("filepath") and os.path.exists(r["filepath"])
+          and r.get("size_bytes", 0) > 0 and r.get("frames") == 12,
+          str(r)[:300])
+    check("render_sequence settings restored",
+          scn.render.resolution_x == 1080
+          and scn.render.image_settings.file_format != 'FFMPEG'
+          and scn.frame_end == 48,
+          f"res_x={scn.render.resolution_x} fmt={scn.render.image_settings.file_format} "
+          f"frame_end={scn.frame_end}")
+
+    r = run("render_sequence", status_only=True)
+    check("render_sequence status_only",
+          r.get("active") is False and "done" in r and "filepath" in r,
+          str(r)[:300])
+
+    resp = server._execute_command_internal(
+        {"type": "render_sequence",
+         "params": {"filepath": os.path.join(tmpdir, "vse_async.mp4"), "wait": False}})
+    check("render_sequence async headless error",
+          resp.get("status") == "error"
+          and "wait=True" in str(resp.get("message", "")),
+          str(resp)[:300])
+
+    # --- remove_strip + clear -------------------------------------------------
+    r = run("manage_sequence", action="remove_strip", strip_name=txt.get("name"))
+    check("vse remove_strip",
+          r.get("removed") == txt.get("name")
+          and txt.get("name") not in
+          [s.get("name") for s in (r.get("timeline") or {}).get("strips", [])],
+          str(r)[:300])
+
+    resp = server._execute_command_internal(
+        {"type": "manage_sequence", "params": {"action": "clear"}})
+    check("vse clear requires confirm",
+          resp.get("status") == "error" and "confirm" in str(resp.get("message", "")),
+          str(resp)[:300])
+
+    r = run("manage_sequence", action="clear", confirm=True)
+    check("vse clear",
+          (r.get("timeline") or {}).get("total_strips") == 0
+          and r.get("removed_strips", 0) >= 1,
+          str(r)[:300])
+
     # --- pause switch --------------------------------------------------------
     bpy.context.scene.blendermcp_paused = True
     resp = server._execute_command_internal({"type": "get_scene_info", "params": {}})

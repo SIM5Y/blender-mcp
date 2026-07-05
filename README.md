@@ -55,6 +55,7 @@ For the current version and changelog, see the [releases page](https://github.co
 - **Scene inspection**: Filterable, paginated scene graph plus detailed per-object info
 - **Code execution**: Run arbitrary Python code in Blender with REPL semantics, scene diffs, and rollback on error
 - **Pipeline**: Export (glTF/FBX/OBJ/USD), import local assets, save/version .blend projects
+- **Video editing & delivery (VSE)**: Assemble rendered shots, text overlays, transitions and fades in the sequencer, then encode platform-preset deliverables (LinkedIn wide/square/vertical) — Blender as a complete production studio
 - **Safety & control**: Undo checkpoints for AI actions, pause switch, and activity log in the Blender panel
 
 ## Components
