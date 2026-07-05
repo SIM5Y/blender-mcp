@@ -347,6 +347,8 @@ For headless setups or CI, credentials can also be injected by environment varia
 ## Troubleshooting
 
 - **Connection issues**: Make sure the Blender addon server is running, and the MCP server is configured on Claude, DO NOT run the uvx command in the terminal. Sometimes, the first command won't go through but after that it starts working.
+- **Disconnects during renders (connection reset / WinError 10054)**: fixed in v1.8.4 — renders in GUI mode are now non-blocking server-side. `render_image`, `render_preview`, `render_animation_preview` (and `render_sequence` with `wait=true`) start an asynchronous render job and the addon replies when it finishes, so the socket is never reset by a blocking render. If a render takes longer than ~170 seconds the addon replies with an error instead of letting the connection time out — use smaller resolutions/samples, or `render_sequence` with `wait=false` and poll with `status_only=true`. If you still see resets, update both addon.py and the server to 1.8.4+.
+- **"Another MCP session is actively using Blender"**: the addon's takeover protection (v1.8.4, default on) rejects a new client while the current one executed a command in the last 120 seconds. Disconnect the other client, wait for the window to lapse, or switch the "Client Takeover" preference to "Newest connection wins".
 - **Timeout errors**: Try simplifying your requests or breaking them into smaller steps
 - **"Legacy/unknown MCP server connected" warning in the panel**: your MCP client is running an old blender-mcp server that drops stdout/errors from code execution — point your MCP config at the current server (e.g. `uvx --from <this repo> blender-mcp`) and reconnect
 - **Poly Haven integration**: Claude is sometimes erratic with its behaviour

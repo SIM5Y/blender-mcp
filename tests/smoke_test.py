@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 import traceback
+from datetime import datetime, timedelta
 
 import bpy
 
@@ -644,6 +645,114 @@ def main():
     check("_summarize_command_types empty",
           mod._summarize_command_types({}) == "none"
           and mod._summarize_command_types(None) == "none", "")
+
+    # --- auto session-record debounce (v1.8.4) -------------------------------
+    parsed = mod._parse_auto_note(
+        "[2026-07-05 10:00] auto: session ran 4 commands (a x3, b x1)")
+    check("_parse_auto_note",
+          parsed is not None and parsed[1] == 4 and parsed[2] == {"a": 3, "b": 1},
+          str(parsed))
+    check("_parse_auto_note rejects manual notes",
+          mod._parse_auto_note("[2026-07-05 10:00] fixed the lighting") is None
+          and mod._parse_auto_note("plain text") is None, "")
+
+    # The auto-stub above just wrote "session ran 7 commands": a second auto
+    # note within the merge window must REPLACE it with summed counts.
+    rec = mod._assignment_load()
+    log_len_before = len(rec.get("log", []))
+    server._record_session_now(
+        {"commands": 2, "mutated": True, "types": {"render_image": 2}})
+    rec = mod._assignment_load()
+    check("auto-note debounce merges within window",
+          len(rec.get("log", [])) == log_len_before
+          and "auto: session ran 9 commands" in rec["log"][-1]
+          and "execute_code x4" in rec["log"][-1]
+          and "render_image x2" in rec["log"][-1],
+          str(rec.get("log", []))[-400:])
+
+    # An auto note OLDER than the window is appended-after, not merged.
+    old_ts = (datetime.now() - timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M")
+    rec["log"][-1] = re.sub(r"^\[[^\]]+\]", f"[{old_ts}]", rec["log"][-1])
+    mod._assignment_store(rec)
+    server._record_session_now(
+        {"commands": 3, "mutated": True, "types": {"ping": 3}})
+    rec = mod._assignment_load()
+    check("auto-note debounce appends after window",
+          len(rec.get("log", [])) == log_len_before + 1
+          and "auto: session ran 3 commands" in rec["log"][-1]
+          and "auto: session ran 9 commands" in rec["log"][-2],
+          str(rec.get("log", []))[-400:])
+
+    # --- GUI-safe deferred renders (v1.8.4; headless: routing only) ----------
+    check("RENDER_DEFERRED_COMMANDS constant",
+          mod.RENDER_DEFERRED_COMMANDS ==
+          {"render_image", "render_preview", "render_animation_preview"}
+          and "get_viewport_screenshot" not in mod.RENDER_DEFERRED_COMMANDS,
+          str(getattr(mod, "RENDER_DEFERRED_COMMANDS", None)))
+    check("deferred routing: background stays synchronous",
+          all(mod._should_defer_render(c, background=True) is False
+              for c in mod.RENDER_DEFERRED_COMMANDS)
+          and mod._should_defer_render("render_sequence", {"wait": True},
+                                       background=True) is False, "")
+    check("deferred routing: headless default is synchronous",
+          mod._should_defer_render("render_image") is False,
+          f"bpy.app.background={bpy.app.background}")
+    check("deferred routing: GUI defers render commands",
+          all(mod._should_defer_render(c, background=False) is True
+              for c in mod.RENDER_DEFERRED_COMMANDS), "")
+    check("deferred routing: render_sequence variants",
+          mod._should_defer_render("render_sequence", {"wait": True},
+                                   background=False) is True
+          and mod._should_defer_render("render_sequence", {},
+                                       background=False) is True
+          and mod._should_defer_render("render_sequence", {"wait": False},
+                                       background=False) is False
+          and mod._should_defer_render("render_sequence", {"status_only": True},
+                                       background=False) is False, "")
+    check("deferred routing: screenshot never deferred",
+          mod._should_defer_render("get_viewport_screenshot",
+                                   background=False) is False
+          and mod._should_defer_render("get_scene_info",
+                                       background=False) is False, "")
+    check("render pipeline busy flag",
+          mod._render_pipeline_busy() is False, "")
+    mod._DEFERRED_JOB["active"] = True
+    check("render pipeline busy via deferred job",
+          mod._render_pipeline_busy() is True, "")
+    mod._DEFERRED_JOB["active"] = False
+    r = run("render_sequence", status_only=True)
+    check("status_only excludes on_complete",
+          "on_complete" not in r and "kind" in r, str(r)[:300])
+
+    # --- client takeover protection (v1.8.4) ---------------------------------
+    check("takeover pref declared",
+          "client_takeover_policy" in
+          getattr(mod.BLENDERMCP_AddonPreferences, "__annotations__", {}),
+          str(list(getattr(mod.BLENDERMCP_AddonPreferences,
+                           "__annotations__", {}).keys())))
+    ann = mod.BLENDERMCP_AddonPreferences.__annotations__.get(
+        "client_takeover_policy")
+    default = getattr(ann, "keywords", {}).get("default")
+    check("takeover pref defaults PROTECT", default == "PROTECT", str(default))
+
+    now = 1000.0
+    check("takeover rejects fresh activity",
+          mod._takeover_decision("PROTECT", True, now - 30, now=now) == "reject",
+          "")
+    check("takeover adopts stale activity",
+          mod._takeover_decision("PROTECT", True,
+                                 now - mod.CLIENT_PROTECT_WINDOW_SECONDS - 1,
+                                 now=now) == "adopt", "")
+    check("takeover NEWEST always adopts",
+          mod._takeover_decision("NEWEST", True, now - 1, now=now) == "adopt", "")
+    check("takeover adopts when no client connected",
+          mod._takeover_decision("PROTECT", False, now - 1, now=now) == "adopt",
+          "")
+    check("takeover adopts when client never commanded",
+          mod._takeover_decision("PROTECT", True, None, now=now) == "adopt", "")
+    check("takeover policy fallback PROTECT",
+          server._get_takeover_policy() == "PROTECT",
+          server._get_takeover_policy())
 
     # --- video sequence editor (VSE) ---------------------------------------
     check("DELIVERY_PRESETS constant",

@@ -287,7 +287,7 @@ try:
     from importlib.metadata import version as _pkg_version
     SERVER_VERSION = _pkg_version("blender-mcp")
 except Exception:
-    SERVER_VERSION = "1.8.3"
+    SERVER_VERSION = "1.8.4"
 
 # Server and addon are released in lockstep from one repo (the VERSION file is
 # the single source of truth), so the addon this server pairs with is simply

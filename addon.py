@@ -27,14 +27,14 @@ from contextlib import redirect_stdout, suppress
 bl_info = {
     "name": "Blender MCP",
     "author": "BlenderMCP",
-    "version": (1, 8, 3),
+    "version": (1, 8, 4),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > BlenderMCP",
     "description": "Connect Blender to Claude via MCP",
     "category": "Interface",
 }
 
-ADDON_VERSION = "1.8.3"
+ADDON_VERSION = "1.8.4"
 
 # Shown to agents talking through a legacy (pre-1.7.1 handshake) MCP server;
 # such servers drop stdout/errors from the new execute_code result shape.
@@ -151,6 +151,114 @@ MUTATING_COMMANDS = {
 BATCH_MAX_COMMANDS = 25
 BATCH_MAX_PAYLOAD_CHARS = 100_000
 
+# GUI-safe renders (v1.8.4): running bpy.ops.render.render synchronously
+# inside the socket-command timer resets the TCP connection in GUI mode
+# (WinError 10054 on the MCP server side). These commands get a deferred
+# response instead: the render starts with 'INVOKE_DEFAULT' and a poller
+# timer sends the response from the main thread when the job finishes.
+# render_sequence joins this set when called with wait=True in GUI mode.
+# get_viewport_screenshot stays synchronous (screenshot_area is fast and
+# was never implicated). Background (headless) mode keeps the proven
+# synchronous path for everything.
+RENDER_DEFERRED_COMMANDS = {
+    "render_image",
+    "render_preview",
+    "render_animation_preview",
+}
+RENDER_DEFERRED_POLL_SECONDS = 0.25
+# Answer before the MCP server's 180s socket timeout closes the connection
+RENDER_DEFERRED_DEADLINE_SECONDS = 170.0
+
+# True while a deferred render job owns the render pipeline. Spans the gaps
+# between the sequential steps of a multi-angle/multi-frame job, when
+# _RENDER_JOB briefly reads inactive.
+_DEFERRED_JOB = {"active": False}
+
+
+def _render_pipeline_busy():
+    """True when any render job (async VSE or deferred-response) is running."""
+    return bool(_RENDER_JOB.get("active") or _DEFERRED_JOB.get("active"))
+
+
+def _should_defer_render(cmd_type, params=None, background=None):
+    """Route a command to the deferred (non-blocking) render path?
+
+    Pure decision helper: True only in GUI mode for RENDER_DEFERRED_COMMANDS
+    and for render_sequence with wait=True (status_only polls and wait=False
+    job starts are already non-blocking). `background` is overridable so the
+    routing is testable headless.
+    """
+    if background is None:
+        background = bpy.app.background
+    if background:
+        return False
+    if cmd_type in RENDER_DEFERRED_COMMANDS:
+        return True
+    if cmd_type == "render_sequence":
+        params = params or {}
+        if params.get("status_only"):
+            return False
+        return bool(params.get("wait", True))
+    return False
+
+
+# Client takeover protection (v1.8.4): a stale, misconfigured client's
+# liveness ping must not steal the connection from a working session.
+CLIENT_PROTECT_WINDOW_SECONDS = 120.0
+CLIENT_TAKEOVER_REJECT_MESSAGE = (
+    "Another MCP session is actively using Blender. "
+    "Retry later or disconnect the other client."
+)
+
+
+def _takeover_decision(policy, client_connected, last_command_time, now=None):
+    """Decide what to do with a newly accepted connection: 'adopt' or 'reject'.
+
+    Under the PROTECT policy a newcomer is rejected while the current client
+    executed a command within the last CLIENT_PROTECT_WINDOW_SECONDS (ping /
+    get_capabilities from the ACTIVE client refresh last_command_time, so an
+    actively-polling session stays protected; a rejected newcomer never
+    reaches a handler and thus never refreshes it).
+    """
+    if policy != "PROTECT" or not client_connected:
+        return "adopt"
+    if last_command_time is None:
+        return "adopt"
+    if now is None:
+        now = time.time()
+    if (now - last_command_time) < CLIENT_PROTECT_WINDOW_SECONDS:
+        return "reject"
+    return "adopt"
+
+
+# Auto session-record debounce (v1.8.4): reconnect churn must not spam the
+# assignment log with near-identical "auto: session ran N commands" notes.
+AUTO_NOTE_MERGE_WINDOW_SECONDS = 15 * 60
+_AUTO_NOTE_RE = re.compile(
+    r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2})\] auto: session ran (\d+) commands \((.*)\)$"
+)
+
+
+def _parse_auto_note(note):
+    """Parse an auto session note into (datetime, total, {type: count}).
+
+    Returns None when the entry is not an auto note (manual notes and
+    handoffs are never merged).
+    """
+    m = _AUTO_NOTE_RE.match(str(note))
+    if not m:
+        return None
+    try:
+        ts = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M")
+    except ValueError:
+        return None
+    counts = {}
+    for part in m.group(3).split(","):
+        pm = re.match(r"^(\S+) x(\d+)$", part.strip())
+        if pm:
+            counts[pm.group(1)] = int(pm.group(2))
+    return ts, int(m.group(2)), counts
+
 def _summarize_command_types(counts, top=5):
     """Format a {command_type: count} dict as 'a x3, b x2' (top N by count)."""
     try:
@@ -208,6 +316,11 @@ _RENDER_JOB = {
     "cancelled": False,
     "error": None,
     "started_at": None,
+    # v1.8.4: job kind ("vse", "panel_clip", or a deferred command type) and
+    # a per-job completion callback (used by the deferred-response driver;
+    # never serialized - status_only strips it).
+    "kind": None,
+    "on_complete": None,
 }
 # Render settings snapshot to restore when an async render finishes/cancels
 _RENDER_JOB_RESTORE = {}
@@ -233,6 +346,17 @@ def _finish_render_job(done=False, cancelled=False):
     if snap:
         try:
             BlenderMCPServer._restore_vse_render_settings(snap)
+        except Exception:
+            pass
+    # Per-job completion callback (deferred-response driver): notify AFTER
+    # the job state and settings restore are settled. The callback only
+    # flags completion - the heavy lifting (next step / response send)
+    # happens in the poller timer, never inside a render handler.
+    callback = _RENDER_JOB.get("on_complete")
+    _RENDER_JOB["on_complete"] = None
+    if callback is not None:
+        try:
+            callback(done=bool(done), cancelled=bool(cancelled))
         except Exception:
             pass
 
@@ -589,6 +713,21 @@ class BlenderMCPServer:
 
         print("BlenderMCP server stopped")
 
+    def _get_takeover_policy(self):
+        """Read the client takeover policy from the addon preferences.
+
+        Called from the accept loop (socket thread): a plain property read,
+        guarded so any RNA hiccup falls back to the safe default (PROTECT).
+        """
+        try:
+            addon_entry = bpy.context.preferences.addons.get(__name__)
+            if addon_entry is not None:
+                return getattr(addon_entry.preferences,
+                               "client_takeover_policy", "PROTECT")
+        except Exception:
+            pass
+        return "PROTECT"
+
     def _server_loop(self):
         """Main server loop in a separate thread"""
         print("Server thread started")
@@ -600,6 +739,28 @@ class BlenderMCPServer:
                 try:
                     client, address = self.socket.accept()
                     print(f"Connected to client: {address}")
+
+                    # Takeover protection (v1.8.4): under the PROTECT policy
+                    # a newcomer may not steal the connection from a session
+                    # that executed a command within the protection window.
+                    if self.active_client is not None and \
+                            _takeover_decision(self._get_takeover_policy(),
+                                               self.client_connected,
+                                               self.last_command_time) == "reject":
+                        print(f"Takeover protection: rejected new client {address} "
+                              f"(active client {self.client_address} is still working)")
+                        try:
+                            client.sendall(json.dumps({
+                                "status": "error",
+                                "message": CLIENT_TAKEOVER_REJECT_MESSAGE,
+                            }).encode('utf-8'))
+                        except Exception:
+                            pass
+                        try:
+                            client.close()
+                        except Exception:
+                            pass
+                        continue
 
                     # Single active client: adopt the new connection,
                     # closing any previous client (its handler will exit).
@@ -702,22 +863,40 @@ class BlenderMCPServer:
                                         print(f"Undo push failed: {str(undo_err)}")
 
                             response = None
+                            # GUI-safe renders (v1.8.4): render commands must
+                            # never run bpy.ops.render.render synchronously in
+                            # this timer - the deferred driver starts the job
+                            # and a poller sends the response when it's done.
+                            # (While paused, fall through: _execute_command_
+                            # internal returns the pause error immediately.)
+                            deferred_owns_response = False
                             try:
-                                response = self.execute_command(command)
-                                # Legacy MCP server detection + compat notice
-                                # (must run before the response is serialized)
-                                try:
-                                    self._update_legacy_detection(conn_stats["commands"])
-                                    response = self._inject_legacy_notice(cmd_type, response)
-                                except Exception:
-                                    pass
-                                response_json = json.dumps(response)
-                                try:
-                                    payload = response_json.encode('utf-8')
-                                    client.sendall(payload)
-                                    self.bytes_sent += len(payload)
-                                except:
-                                    print("Failed to send response - client disconnected")
+                                if _should_defer_render(cmd_type, command.get("params")) and \
+                                        not getattr(bpy.context.scene, "blendermcp_paused", False):
+                                    response = self._defer_render_command(
+                                        client, command, start_time)
+                                    if response is None:
+                                        # Job started (or the driver already
+                                        # sent an error): the deferred path
+                                        # owns the response + activity log.
+                                        deferred_owns_response = True
+                                else:
+                                    response = self.execute_command(command)
+                                if not deferred_owns_response:
+                                    # Legacy MCP server detection + compat notice
+                                    # (must run before the response is serialized)
+                                    try:
+                                        self._update_legacy_detection(conn_stats["commands"])
+                                        response = self._inject_legacy_notice(cmd_type, response)
+                                    except Exception:
+                                        pass
+                                    response_json = json.dumps(response)
+                                    try:
+                                        payload = response_json.encode('utf-8')
+                                        client.sendall(payload)
+                                        self.bytes_sent += len(payload)
+                                    except:
+                                        print("Failed to send response - client disconnected")
                             except Exception as e:
                                 print(f"Error executing command: {str(e)}")
                                 traceback.print_exc()
@@ -733,10 +912,11 @@ class BlenderMCPServer:
                                     pass
                             finally:
                                 self.executing = False
-                                try:
-                                    self._log_activity(cmd_type, command, response, start_time)
-                                except Exception:
-                                    pass
+                                if not deferred_owns_response:
+                                    try:
+                                        self._log_activity(cmd_type, command, response, start_time)
+                                    except Exception:
+                                        pass
                                 self._redraw_ui()
                             return None
 
@@ -841,9 +1021,9 @@ class BlenderMCPServer:
         if not bpy.data.filepath:
             return
         total = int(conn_stats.get("commands", 0) or 0)
-        summary = _summarize_command_types(conn_stats.get("types"))
-        now = datetime.now().strftime("%Y-%m-%d %H:%M")
-        note = f"[{now}] auto: session ran {total} commands ({summary})"
+        types = dict(conn_stats.get("types") or {})
+        now_dt = datetime.now()
+        now = now_dt.strftime("%Y-%m-%d %H:%M")
 
         record = _assignment_load()
         if record is None:
@@ -862,8 +1042,29 @@ class BlenderMCPServer:
                 "handoff": None,
                 "token_estimate": 0,
             }
-        record.setdefault("log", []).append(note)
-        record["log"] = record["log"][-100:]
+        # Debounce (v1.8.4): reconnect churn produces several near-identical
+        # auto notes within minutes. If the LAST log entry is also an auto
+        # note younger than the merge window, REPLACE it with a merged note
+        # (summed command count, merged type counts) instead of appending.
+        log = record.setdefault("log", [])
+        merged = False
+        if log:
+            parsed = _parse_auto_note(log[-1])
+            if parsed is not None:
+                prev_dt, prev_total, prev_types = parsed
+                age = (now_dt - prev_dt).total_seconds()
+                if 0 <= age < AUTO_NOTE_MERGE_WINDOW_SECONDS:
+                    total += prev_total
+                    for name, n in prev_types.items():
+                        types[name] = types.get(name, 0) + n
+                    merged = True
+        summary = _summarize_command_types(types)
+        note = f"[{now}] auto: session ran {total} commands ({summary})"
+        if merged:
+            log[-1] = note
+        else:
+            log.append(note)
+        record["log"] = log[-100:]
         record["updated"] = now
         try:
             record["token_estimate"] = self._assignment_tokens(record)
@@ -1200,6 +1401,15 @@ class BlenderMCPServer:
                     "omitted) cannot run inside a batch - a long encode would "
                     "block the socket. Call it as a separate command, or use "
                     "wait=False / status_only=True inside the batch."
+                )
+            if sub_type in RENDER_DEFERRED_COMMANDS and not bpy.app.background:
+                # GUI-safe renders (v1.8.4): inside a batch these would run
+                # synchronously and reset the TCP connection - same reason
+                # they get a deferred response as single commands.
+                raise ValueError(
+                    f"commands[{i}]: {sub_type} cannot run inside a batch in "
+                    "GUI mode - a blocking render resets the connection. "
+                    "Call it as a separate command."
                 )
 
         results = []
@@ -2871,12 +3081,221 @@ class BlenderMCPServer:
             if scene.frame_current != snap["frame_current"]:
                 scene.frame_set(snap["frame_current"])
 
-    def _opengl_render_to_base64(self, filepath):
-        """OpenGL-render the scene camera to filepath, return the file as base64"""
-        bpy.context.scene.render.filepath = filepath
-        bpy.ops.render.opengl(write_still=True, view_context=False)
-        with open(filepath, "rb") as f:
-            return base64.b64encode(f.read()).decode("utf-8")
+    # ------------------------------------------------------------------
+    # Render job machinery (v1.8.4 GUI-safe renders)
+    #
+    # Every render handler is factored into:
+    #   prepare  - validate params, snapshot settings, configure the scene,
+    #              return a job dict (steps / result / cleanup callables)
+    #   run      - background mode: _run_render_job_sync (blocking, proven)
+    #              GUI mode: _defer_render_command drives the steps through
+    #              bpy.ops.render.render('INVOKE_DEFAULT') + a poller timer
+    #   finish   - job["result"]() builds the payload, job["cleanup"]()
+    #              restores settings and removes temp objects/files
+    # ------------------------------------------------------------------
+
+    def _run_render_job_sync(self, job):
+        """Blocking render path (background mode - unchanged semantics)."""
+        try:
+            for step in job["steps"]:
+                if step.get("setup"):
+                    step["setup"]()
+                job["sync_render"]()
+                step["collect"](step["filepath"])
+            return job["result"]()
+        finally:
+            job["cleanup"]()
+
+    def _prepare_deferred_render_job(self, cmd_type, params):
+        """Build the job dict for a deferred (GUI) render command."""
+        if cmd_type == "render_image":
+            return self._render_image_prepare(deferred=True, **params)
+        if cmd_type == "render_preview":
+            return self._render_preview_prepare(deferred=True, **params)
+        if cmd_type == "render_animation_preview":
+            return self._render_animation_preview_prepare(deferred=True, **params)
+        if cmd_type == "render_sequence":
+            return self._render_sequence_deferred_prepare(**params)
+        raise ValueError(f"Command '{cmd_type}' is not a deferred render command.")
+
+    def _defer_render_command(self, client, command, start_time):
+        """GUI render path: start an async render job, respond when it ends.
+
+        Runs on the main thread (inside execute_wrapper's timer). Returns an
+        immediate error response dict (busy / prepare failure), or None when
+        the deferred machinery owns the response from here on. Exactly one
+        response is ever sent per command: every terminal path goes through
+        the flag-guarded _send closure below.
+        """
+        cmd_type = command.get("type")
+        params = dict(command.get("params") or {})
+
+        # Never queue: a second render command while a job runs is an error
+        if _render_pipeline_busy():
+            return {
+                "status": "error",
+                "message": "A render job is already active in Blender. Wait "
+                           "for it to finish and try again (render_sequence "
+                           "with status_only=true reports progress).",
+            }
+
+        try:
+            job = self._prepare_deferred_render_job(cmd_type, params)
+        except Exception as e:
+            traceback.print_exc()
+            return {"status": "error", "message": str(e)}
+
+        state = {"responded": False, "step": 0,
+                 "step_done": False, "step_ok": False}
+        _DEFERRED_JOB["active"] = True
+
+        def _send(response):
+            # Exactly-one-response guard
+            if state["responded"]:
+                return
+            state["responded"] = True
+            _DEFERRED_JOB["active"] = False
+            try:
+                payload = json.dumps(response).encode('utf-8')
+                client.sendall(payload)
+                self.bytes_sent += len(payload)
+            except Exception:
+                print("Failed to send deferred render response - client disconnected")
+            # Activity log at completion, with the real duration
+            try:
+                self._log_activity(cmd_type, command, response, start_time)
+            except Exception:
+                pass
+            self._redraw_ui()
+
+        def _cleanup():
+            try:
+                job["cleanup"]()
+            except Exception:
+                pass
+
+        def _fail(message):
+            _cleanup()
+            _send({"status": "error", "message": message})
+
+        def _on_step_complete(done=False, cancelled=False):
+            # Called from _finish_render_job (render handler context): only
+            # flag completion - the poller does the follow-up work.
+            state["step_done"] = True
+            state["step_ok"] = bool(done) and not cancelled
+
+        def _start_step():
+            """Configure + INVOKE the current step. False if it failed
+            (the error response has then already been sent)."""
+            step = job["steps"][state["step"]]
+            try:
+                if step.get("setup"):
+                    step["setup"]()
+                _ensure_render_handlers()
+                _RENDER_JOB.update({
+                    "active": True,
+                    "frame_current": step.get("frame"),
+                    "frame_end": job.get("frame_end"),
+                    "filepath": job.get("progress_filepath"),
+                    "done": False,
+                    "cancelled": False,
+                    "error": None,
+                    "started_at": time.time(),
+                    "kind": cmd_type,
+                    "on_complete": _on_step_complete,
+                })
+                # The deferred job owns settings restoration (in cleanup):
+                # _finish_render_job must not restore between steps.
+                _RENDER_JOB_RESTORE.clear()
+                state["step_done"] = False
+                state["step_ok"] = False
+                kwargs = {"animation": True} if job.get("animation") \
+                    else {"write_still": True}
+                try:
+                    window = bpy.context.window_manager.windows[0]
+                except Exception:
+                    window = None
+                if window is not None:
+                    with bpy.context.temp_override(window=window):
+                        ret = bpy.ops.render.render('INVOKE_DEFAULT', **kwargs)
+                else:
+                    ret = bpy.ops.render.render('INVOKE_DEFAULT', **kwargs)
+                if 'CANCELLED' in ret:
+                    raise RuntimeError(
+                        "Blender refused to start the render "
+                        "(operator returned CANCELLED)."
+                    )
+            except Exception as e:
+                _RENDER_JOB["active"] = False
+                _RENDER_JOB["on_complete"] = None
+                _fail(f"Render failed to start: {str(e)}")
+                return False
+            return True
+
+        def _poll():
+            try:
+                return _poll_inner()
+            except Exception as e:
+                traceback.print_exc()
+                _fail(f"Deferred render failed: {str(e)}")
+                return None
+
+        def _poll_inner():
+            if state["responded"]:
+                return None
+            if time.time() - start_time > RENDER_DEFERRED_DEADLINE_SECONDS:
+                # A running render cannot be aborted from Python: detach,
+                # answer now (before the client's 180s socket window closes)
+                # and clean up when the job eventually finishes.
+                if _RENDER_JOB.get("active"):
+                    _RENDER_JOB["on_complete"] = \
+                        lambda done=False, cancelled=False: _cleanup()
+                else:
+                    _cleanup()
+                _send({
+                    "status": "error",
+                    "message": f"Render did not finish within "
+                               f"{int(RENDER_DEFERRED_DEADLINE_SECONDS)}s. Use a "
+                               "smaller resolution / fewer samples (e.g. "
+                               "render_image at 640x360), or render_sequence "
+                               "with wait=false and poll with status_only=true.",
+                })
+                return None
+            if not state["step_done"]:
+                return RENDER_DEFERRED_POLL_SECONDS
+            if not state["step_ok"]:
+                _fail("Render was cancelled in Blender before it finished.")
+                return None
+            step = job["steps"][state["step"]]
+            try:
+                step["collect"](step["filepath"])
+            except Exception as e:
+                _fail(f"Render finished but reading the output failed: {str(e)}")
+                return None
+            state["step"] += 1
+            if state["step"] < len(job["steps"]):
+                # Sequential multi-step job (per angle / per frame):
+                # completion of one step starts the next.
+                if not _start_step():
+                    return None
+                return RENDER_DEFERRED_POLL_SECONDS
+            try:
+                result = job["result"]()
+            except Exception as e:
+                _fail(f"Render finished but building the response failed: {str(e)}")
+                return None
+            _cleanup()
+            _send({"status": "success", "result": result})
+            return None
+
+        if not _start_step():
+            return None  # error response already sent by _fail
+        try:
+            bpy.app.timers.register(
+                _poll, first_interval=RENDER_DEFERRED_POLL_SECONDS)
+        except Exception as e:
+            _fail(f"Could not start the render poller: {str(e)}")
+        return None
 
     def set_camera(self, action, camera=None, object_names=None, preset=None,
                    focal_length=None, ortho=False, margin=1.2, location=None, look_at=None):
@@ -2956,6 +3375,19 @@ class BlenderMCPServer:
 
     def render_preview(self, object_names=None, angles=None, max_size=800, shading="SOLID"):
         """OpenGL-render the target objects from preset angles using a temp camera"""
+        job = self._render_preview_prepare(
+            object_names=object_names, angles=angles,
+            max_size=max_size, shading=shading)
+        return self._run_render_job_sync(job)
+
+    def _render_preview_prepare(self, object_names=None, angles=None, max_size=800,
+                                shading="SOLID", deferred=False):
+        """Prepare a render_preview job: temp camera + one step per angle.
+
+        deferred=True (GUI path) renders through the engine instead of the
+        blocking OpenGL draw: WORKBENCH stands in for SOLID shading, EEVEE
+        for MATERIAL.
+        """
         if angles is None:
             angles = ["front", "right", "top", "isometric"]
         if isinstance(angles, str):
@@ -2981,8 +3413,6 @@ class BlenderMCPServer:
 
         snap = self._snapshot_render_settings()
         cam_obj = self._create_temp_camera()
-        temp_files = []
-        images = []
         try:
             render = scene.render
             render.resolution_x = size
@@ -2990,27 +3420,52 @@ class BlenderMCPServer:
             render.resolution_percentage = 100
             render.image_settings.file_format = 'PNG'
             scene.camera = cam_obj
-            if shading == "MATERIAL" and hasattr(scene, "display") and hasattr(scene.display, "shading"):
+            if deferred:
+                candidates = ["BLENDER_WORKBENCH"] if shading == "SOLID" \
+                    else ["BLENDER_EEVEE_NEXT", "BLENDER_EEVEE"]
+                for candidate in candidates:
+                    with suppress(Exception):
+                        render.engine = candidate
+                        break
+            elif shading == "MATERIAL" and hasattr(scene, "display") \
+                    and hasattr(scene.display, "shading"):
                 with suppress(Exception):
                     scene.display.shading.type = 'MATERIAL'
+        except Exception:
+            self._remove_temp_camera(cam_obj)
+            self._restore_render_settings(snap)
+            raise
 
-            for i, angle in enumerate(angles):
+        images = []
+        temp_files = []
+        steps = []
+        stamp = int(time.time() * 1000)
+        for i, angle in enumerate(angles):
+            filepath = os.path.join(
+                tempfile.gettempdir(),
+                f"blendermcp_preview_{os.getpid()}_{stamp}_{i}.png"
+            )
+            temp_files.append(filepath)
+
+            def _setup(angle=angle, filepath=filepath):
                 self._frame_camera_on_aabb(cam_obj, aabb, CAMERA_PRESETS[angle], 1.2)
                 with suppress(Exception):
                     bpy.context.view_layer.update()
-                filepath = os.path.join(
-                    tempfile.gettempdir(),
-                    f"blendermcp_preview_{os.getpid()}_{int(time.time() * 1000)}_{i}.png"
-                )
-                temp_files.append(filepath)
-                images.append({
-                    "angle": angle,
-                    "image_data": self._opengl_render_to_base64(filepath),
-                    "format": "png",
-                    "width": size,
-                    "height": size,
-                })
-        finally:
+                scene.render.filepath = filepath
+
+            def _collect(fp, angle=angle):
+                with open(fp, "rb") as f:
+                    images.append({
+                        "angle": angle,
+                        "image_data": base64.b64encode(f.read()).decode("utf-8"),
+                        "format": "png",
+                        "width": size,
+                        "height": size,
+                    })
+
+            steps.append({"setup": _setup, "filepath": filepath, "collect": _collect})
+
+        def _cleanup():
             self._remove_temp_camera(cam_obj)
             for filepath in temp_files:
                 with suppress(Exception):
@@ -3018,11 +3473,34 @@ class BlenderMCPServer:
                         os.remove(filepath)
             self._restore_render_settings(snap)
 
-        return {"images": images}
+        return {
+            "kind": "render_preview",
+            "animation": False,
+            "steps": steps,
+            "sync_render": lambda: bpy.ops.render.opengl(
+                write_still=True, view_context=False),
+            "result": lambda: {"images": images},
+            "cleanup": _cleanup,
+        }
 
     def render_animation_preview(self, frame_start=None, frame_end=None, num_frames=6,
                                  max_size=512, camera=None):
         """OpenGL-render evenly sampled frames of the animation from the scene camera"""
+        job = self._render_animation_preview_prepare(
+            frame_start=frame_start, frame_end=frame_end,
+            num_frames=num_frames, max_size=max_size, camera=camera)
+        return self._run_render_job_sync(job)
+
+    def _render_animation_preview_prepare(self, frame_start=None, frame_end=None,
+                                          num_frames=6, max_size=512, camera=None,
+                                          deferred=False):
+        """Prepare an animation preview job: one sequential step per sampled
+        frame (frame_set + single-frame render to a distinct temp file -
+        never animation=True).
+
+        deferred=True (GUI path) renders through WORKBENCH instead of the
+        blocking OpenGL draw.
+        """
         scene = bpy.context.scene
         frame_start = scene.frame_start if frame_start is None else int(frame_start)
         frame_end = scene.frame_end if frame_end is None else int(frame_end)
@@ -3043,8 +3521,6 @@ class BlenderMCPServer:
             })
 
         snap = self._snapshot_render_settings()
-        temp_files = []
-        images = []
         try:
             render = scene.render
             render.resolution_x = size
@@ -3052,22 +3528,42 @@ class BlenderMCPServer:
             render.resolution_percentage = 100
             render.image_settings.file_format = 'PNG'
             scene.camera = cam_obj
+            if deferred:
+                with suppress(Exception):
+                    render.engine = 'BLENDER_WORKBENCH'
+        except Exception:
+            self._restore_render_settings(snap)
+            raise
 
-            for i, frame in enumerate(frames):
+        images = []
+        temp_files = []
+        steps = []
+        stamp = int(time.time() * 1000)
+        for i, frame in enumerate(frames):
+            filepath = os.path.join(
+                tempfile.gettempdir(),
+                f"blendermcp_animprev_{os.getpid()}_{stamp}_{i}.png"
+            )
+            temp_files.append(filepath)
+
+            def _setup(frame=frame, filepath=filepath):
                 scene.frame_set(frame)
-                filepath = os.path.join(
-                    tempfile.gettempdir(),
-                    f"blendermcp_animprev_{os.getpid()}_{int(time.time() * 1000)}_{i}.png"
-                )
-                temp_files.append(filepath)
-                images.append({
-                    "frame": frame,
-                    "image_data": self._opengl_render_to_base64(filepath),
-                    "format": "png",
-                    "width": size,
-                    "height": size,
-                })
-        finally:
+                scene.render.filepath = filepath
+
+            def _collect(fp, frame=frame):
+                with open(fp, "rb") as f:
+                    images.append({
+                        "frame": frame,
+                        "image_data": base64.b64encode(f.read()).decode("utf-8"),
+                        "format": "png",
+                        "width": size,
+                        "height": size,
+                    })
+
+            steps.append({"setup": _setup, "filepath": filepath,
+                          "collect": _collect, "frame": frame})
+
+        def _cleanup():
             for filepath in temp_files:
                 with suppress(Exception):
                     if os.path.exists(filepath):
@@ -3075,11 +3571,29 @@ class BlenderMCPServer:
             # Also restores the original current frame
             self._restore_render_settings(snap)
 
-        return {"frames_sampled": frames, "images": images}
+        return {
+            "kind": "render_animation_preview",
+            "animation": False,
+            "frame_end": frames[-1],
+            "steps": steps,
+            "sync_render": lambda: bpy.ops.render.opengl(
+                write_still=True, view_context=False),
+            "result": lambda: {"frames_sampled": frames, "images": images},
+            "cleanup": _cleanup,
+        }
 
     def render_image(self, camera=None, resolution_x=960, resolution_y=540,
                      samples=None, engine=None, format="PNG"):
         """Full render through the render engine, returned as a base64 image"""
+        job = self._render_image_prepare(
+            camera=camera, resolution_x=resolution_x, resolution_y=resolution_y,
+            samples=samples, engine=engine, format=format)
+        return self._run_render_job_sync(job)
+
+    def _render_image_prepare(self, camera=None, resolution_x=960, resolution_y=540,
+                              samples=None, engine=None, format="PNG",
+                              deferred=False):
+        """Prepare a full-render job (single step, engine render)."""
         scene = bpy.context.scene
         cam_obj = self._resolve_render_camera(camera)
 
@@ -3131,18 +3645,31 @@ class BlenderMCPServer:
             render.image_settings.file_format = file_format
             render.filepath = filepath
             scene.camera = cam_obj
+        except Exception:
+            self._restore_render_settings(snap)
+            raise
 
-            bpy.ops.render.render(write_still=True)
+        payload = {}
 
-            with open(filepath, "rb") as f:
-                image_data = base64.b64encode(f.read()).decode("utf-8")
-        finally:
+        def _collect(fp):
+            with open(fp, "rb") as f:
+                payload["image_data"] = base64.b64encode(f.read()).decode("utf-8")
+
+        def _cleanup():
             with suppress(Exception):
                 if os.path.exists(filepath):
                     os.remove(filepath)
             self._restore_render_settings(snap)
 
-        return {"image_data": image_data, "format": fmt, "width": res_x, "height": res_y}
+        return {
+            "kind": "render_image",
+            "animation": False,
+            "steps": [{"setup": None, "filepath": filepath, "collect": _collect}],
+            "sync_render": lambda: bpy.ops.render.render(write_still=True),
+            "result": lambda: {"image_data": payload.get("image_data"),
+                               "format": fmt, "width": res_x, "height": res_y},
+            "cleanup": _cleanup,
+        }
 
     # ------------------------------------------------------------------
     # Pipeline handlers (C4)
@@ -4197,16 +4724,14 @@ class BlenderMCPServer:
             if scene.frame_current != snap["frame_current"]:
                 scene.frame_set(snap["frame_current"])
 
-    def render_sequence(self, filepath=None, preset=None, resolution=None, fps=None,
-                        frame_start=None, frame_end=None, container="MPEG4",
-                        video_bitrate=None, wait=True, status_only=False):
-        """Encode the sequencer timeline to a video file (see server tool docstring)"""
-        if status_only:
-            job = dict(_RENDER_JOB)
-            if job.get("started_at"):
-                job["elapsed_seconds"] = round(time.time() - job["started_at"], 1)
-            return job
+    def _render_sequence_prepare(self, filepath=None, preset=None, resolution=None,
+                                 fps=None, frame_start=None, frame_end=None,
+                                 container="MPEG4", video_bitrate=None):
+        """Validate + configure everything for a sequencer encode.
 
+        Returns an info dict (normalized filepath, frames, fps, snapshot).
+        The CALLER owns restoring info["snapshot"] on every path.
+        """
         if not filepath:
             raise ValueError("filepath is required (e.g. 'C:/renders/clip.mp4').")
         container = str(container).upper()
@@ -4223,23 +4748,11 @@ class BlenderMCPServer:
         if parent:
             os.makedirs(parent, exist_ok=True)
 
-        if not wait and bpy.app.background:
-            raise ValueError(
-                "wait=False needs Blender's interactive event loop and cannot work "
-                "in background (headless) mode. Call again with wait=True."
-            )
-        if not wait and _RENDER_JOB.get("active"):
-            raise ValueError(
-                "A render job is already active. Poll with status_only=true, or "
-                "wait for it to finish."
-            )
-
         scene = bpy.context.scene
         self._get_sequence_editor()
         res, fps_val = self._resolve_delivery(preset, resolution, fps)
 
         snap = self._snapshot_vse_render_settings()
-        restore_in_finally = True
         try:
             render = scene.render
             self._apply_delivery(res, fps_val)
@@ -4249,66 +4762,142 @@ class BlenderMCPServer:
                 scene.frame_end = int(frame_end)
             self._apply_ffmpeg_output_settings(container, video_bitrate)
             render.filepath = filepath
+        except Exception:
+            self._restore_vse_render_settings(snap)
+            raise
 
-            frames = scene.frame_end - scene.frame_start + 1
+        frames = scene.frame_end - scene.frame_start + 1
+        try:
+            fps_eff = render.fps / render.fps_base
+        except Exception:
+            fps_eff = float(render.fps)
+        return {
+            "filepath": filepath,
+            "expected_ext": expected_ext,
+            "container": container,
+            "frames": frames,
+            "fps_eff": fps_eff,
+            "resolution": [render.resolution_x, render.resolution_y],
+            "snapshot": snap,
+        }
+
+    @staticmethod
+    def _render_sequence_result(info):
+        """Build the finished-encode response (with output-file fallback glob)."""
+        filepath = info["filepath"]
+        actual = filepath
+        if not os.path.exists(actual):
+            import glob as _glob
+            candidates = sorted(_glob.glob(filepath + "*")) + sorted(
+                _glob.glob(os.path.splitext(filepath)[0] + "*" + info["expected_ext"]))
+            actual = candidates[0] if candidates else None
+        if not actual or not os.path.exists(actual):
+            return {"error": f"Render finished but no output file was found at "
+                             f"'{filepath}'. Check the filepath is writable."}
+        frames = info["frames"]
+        fps_eff = info["fps_eff"]
+        return {
+            "filepath": actual,
+            "size_bytes": os.path.getsize(actual),
+            "frames": frames,
+            "duration_seconds": round(frames / fps_eff, 3) if fps_eff else None,
+            "fps": round(fps_eff, 4),
+            "resolution": info["resolution"],
+            "container": info["container"],
+        }
+
+    def _render_sequence_deferred_prepare(self, filepath=None, preset=None,
+                                          resolution=None, fps=None,
+                                          frame_start=None, frame_end=None,
+                                          container="MPEG4", video_bitrate=None,
+                                          wait=True, status_only=False):
+        """Prepare a deferred render_sequence job (GUI mode, wait=True)."""
+        info = self._render_sequence_prepare(
+            filepath=filepath, preset=preset, resolution=resolution, fps=fps,
+            frame_start=frame_start, frame_end=frame_end,
+            container=container, video_bitrate=video_bitrate)
+        scene = bpy.context.scene
+        return {
+            "kind": "render_sequence",
+            "animation": True,
+            "frame_end": scene.frame_end,
+            "progress_filepath": info["filepath"],
+            "steps": [{"setup": None, "filepath": info["filepath"],
+                       "collect": lambda fp: None,
+                       "frame": scene.frame_start}],
+            "sync_render": lambda: bpy.ops.render.render(
+                animation=True, write_still=False),
+            "result": lambda: self._render_sequence_result(info),
+            "cleanup": lambda: self._restore_vse_render_settings(info["snapshot"]),
+        }
+
+    def render_sequence(self, filepath=None, preset=None, resolution=None, fps=None,
+                        frame_start=None, frame_end=None, container="MPEG4",
+                        video_bitrate=None, wait=True, status_only=False):
+        """Encode the sequencer timeline to a video file (see server tool docstring)"""
+        if status_only:
+            # on_complete is a callable owned by the deferred driver: never
+            # serialize it into the status payload
+            job = {k: v for k, v in _RENDER_JOB.items() if k != "on_complete"}
+            if job.get("started_at"):
+                job["elapsed_seconds"] = round(time.time() - job["started_at"], 1)
+            return job
+
+        if not wait and bpy.app.background:
+            raise ValueError(
+                "wait=False needs Blender's interactive event loop and cannot work "
+                "in background (headless) mode. Call again with wait=True."
+            )
+        if not wait and _render_pipeline_busy():
+            raise ValueError(
+                "A render job is already active. Poll with status_only=true, or "
+                "wait for it to finish."
+            )
+
+        info = self._render_sequence_prepare(
+            filepath=filepath, preset=preset, resolution=resolution, fps=fps,
+            frame_start=frame_start, frame_end=frame_end,
+            container=container, video_bitrate=video_bitrate)
+        snap = info["snapshot"]
+        scene = bpy.context.scene
+
+        if wait:
             try:
-                fps_eff = render.fps / render.fps_base
-            except Exception:
-                fps_eff = float(render.fps)
-
-            if wait:
                 bpy.ops.render.render(animation=True, write_still=False)
-                actual = filepath
-                if not os.path.exists(actual):
-                    import glob as _glob
-                    candidates = sorted(_glob.glob(filepath + "*")) + sorted(
-                        _glob.glob(os.path.splitext(filepath)[0] + "*" + expected_ext))
-                    actual = candidates[0] if candidates else None
-                if not actual or not os.path.exists(actual):
-                    return {"error": f"Render finished but no output file was found at "
-                                     f"'{filepath}'. Check the filepath is writable."}
-                return {
-                    "filepath": actual,
-                    "size_bytes": os.path.getsize(actual),
-                    "frames": frames,
-                    "duration_seconds": round(frames / fps_eff, 3) if fps_eff else None,
-                    "fps": round(fps_eff, 4),
-                    "resolution": [render.resolution_x, render.resolution_y],
-                    "container": container,
-                }
-
-            # Async job: restore happens in the render_complete/cancel handlers
-            _ensure_render_handlers()
-            _RENDER_JOB.update({
-                "active": True,
-                "frame_current": scene.frame_start,
-                "frame_end": scene.frame_end,
-                "filepath": filepath,
-                "done": False,
-                "cancelled": False,
-                "error": None,
-                "started_at": time.time(),
-            })
-            _RENDER_JOB_RESTORE.clear()
-            _RENDER_JOB_RESTORE.update(snap)
-            restore_in_finally = False
-            try:
-                bpy.ops.render.render('INVOKE_DEFAULT', animation=True)
-            except Exception as e:
-                _RENDER_JOB["active"] = False
-                _RENDER_JOB["error"] = str(e)
-                _RENDER_JOB_RESTORE.clear()
-                restore_in_finally = True
-                raise
-            return {
-                "job_started": True,
-                "filepath": filepath,
-                "frames": frames,
-                "poll": "Call render_sequence with status_only=true to track progress.",
-            }
-        finally:
-            if restore_in_finally:
+                return self._render_sequence_result(info)
+            finally:
                 self._restore_vse_render_settings(snap)
+
+        # Async job: restore happens in the render_complete/cancel handlers
+        _ensure_render_handlers()
+        _RENDER_JOB.update({
+            "active": True,
+            "frame_current": scene.frame_start,
+            "frame_end": scene.frame_end,
+            "filepath": info["filepath"],
+            "done": False,
+            "cancelled": False,
+            "error": None,
+            "started_at": time.time(),
+            "kind": "vse",
+            "on_complete": None,
+        })
+        _RENDER_JOB_RESTORE.clear()
+        _RENDER_JOB_RESTORE.update(snap)
+        try:
+            bpy.ops.render.render('INVOKE_DEFAULT', animation=True)
+        except Exception as e:
+            _RENDER_JOB["active"] = False
+            _RENDER_JOB["error"] = str(e)
+            _RENDER_JOB_RESTORE.clear()
+            self._restore_vse_render_settings(snap)
+            raise
+        return {
+            "job_started": True,
+            "filepath": info["filepath"],
+            "frames": info["frames"],
+            "poll": "Call render_sequence with status_only=true to track progress.",
+        }
 
     def get_polyhaven_categories(self, asset_type):
         """Get categories for a specific asset type from Polyhaven"""
@@ -6283,6 +6872,20 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
                     "automatically write a numbered snapshot to the versions folder",
         default=True
     )
+    client_takeover_policy: bpy.props.EnumProperty(
+        name="Client Takeover",
+        description="What happens when a new MCP client connects while another "
+                    "client is already connected",
+        items=[
+            ("PROTECT", "Protect active session",
+             "Reject new connections while the current client executed a "
+             "command within the last 120 seconds (a stale client cannot "
+             "steal a working session)"),
+            ("NEWEST", "Newest connection wins",
+             "Always adopt the newest connection, closing the previous client"),
+        ],
+        default="PROTECT"
+    )
     hyper3d_api_key: bpy.props.StringProperty(
         name="Hyper3D API Key",
         subtype="PASSWORD",
@@ -6381,6 +6984,10 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
         box.prop(self, "auto_version_on_session_end")
         box.label(text="Snapshots go to the 'versions' folder next to the saved .blend",
                   icon='INFO')
+        box.prop(self, "client_takeover_policy")
+        box.label(text="Protect: a working session cannot be hijacked by a new client "
+                       "for 120s after its last command",
+                  icon='INFO')
 
         # Updates section
         layout.separator()
@@ -6425,7 +7032,17 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
             if paused:
                 box.label(text="Paused - commands are rejected", icon='PAUSE')
             if server.client_connected and server.client_address:
-                box.label(text=f"Client connected: {server.client_address}", icon='LINKED')
+                # "protected": the PROTECT policy would currently reject a
+                # takeover attempt (the client commanded within the window)
+                policy = getattr(prefs, "client_takeover_policy", "PROTECT") \
+                    if prefs is not None else "PROTECT"
+                protected = _takeover_decision(
+                    policy, True, server.last_command_time) == "reject"
+                client_text = f"Client connected: {server.client_address}"
+                if protected:
+                    client_text += " (protected)"
+                box.label(text=client_text,
+                          icon='LOCKED' if protected else 'LINKED')
                 if getattr(server, "legacy_client", False):
                     row = box.row()
                     row.alert = True
@@ -6522,7 +7139,12 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
             row = box.row()
             cur = _RENDER_JOB.get("frame_current")
             end = _RENDER_JOB.get("frame_end")
-            row.label(text=f"Rendering frame {cur} / {end}", icon='RENDER_ANIMATION')
+            if cur is not None and end is not None:
+                progress = f"Rendering frame {cur} / {end}"
+            else:
+                # Deferred single-image jobs have no frame range
+                progress = f"Rendering ({_RENDER_JOB.get('kind') or 'job'})..."
+            row.label(text=progress, icon='RENDER_ANIMATION')
             row.operator("blendermcp.cancel_render", text="Cancel", icon='X')
         elif _LAST_RENDER_PATH:
             row = box.row()
@@ -6813,7 +7435,7 @@ class BLENDERMCP_OT_RenderStill(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return context.scene.camera is not None and not _RENDER_JOB.get("active")
+        return context.scene.camera is not None and not _render_pipeline_busy()
 
     def execute(self, context):
         global _LAST_RENDER_PATH
@@ -6847,7 +7469,7 @@ class BLENDERMCP_OT_RenderClip(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return not _RENDER_JOB.get("active") and not bpy.app.background
+        return not _render_pipeline_busy() and not bpy.app.background
 
     def execute(self, context):
         scene = context.scene
@@ -6878,6 +7500,8 @@ class BLENDERMCP_OT_RenderClip(bpy.types.Operator):
             "cancelled": False,
             "error": None,
             "started_at": time.time(),
+            "kind": "panel_clip",
+            "on_complete": None,
         })
         _RENDER_JOB_RESTORE.clear()
         _RENDER_JOB_RESTORE.update(snap)
