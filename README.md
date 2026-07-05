@@ -347,6 +347,7 @@ For headless setups or CI, credentials can also be injected by environment varia
 
 - **Connection issues**: Make sure the Blender addon server is running, and the MCP server is configured on Claude, DO NOT run the uvx command in the terminal. Sometimes, the first command won't go through but after that it starts working.
 - **Timeout errors**: Try simplifying your requests or breaking them into smaller steps
+- **"Legacy/unknown MCP server connected" warning in the panel**: your MCP client is running an old blender-mcp server that drops stdout/errors from code execution — point your MCP config at the current server (e.g. `uvx --from <this repo> blender-mcp`) and reconnect
 - **Poly Haven integration**: Claude is sometimes erratic with its behaviour
 - **Have you tried turning it off and on again?**: If you're still having connection errors, try restarting both Claude and the Blender server
 

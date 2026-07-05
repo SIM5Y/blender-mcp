@@ -281,16 +281,18 @@ mcp = FastMCP(
 # Global connection for resources (since resources can't access context)
 _blender_connection = None
 
-# Addon version this server release is designed to pair with
-EXPECTED_ADDON_VERSION = "1.7.1"
-
 # This server's own version (from installed package metadata; falls back to
 # the release version when running from an uninstalled source checkout)
 try:
     from importlib.metadata import version as _pkg_version
     SERVER_VERSION = _pkg_version("blender-mcp")
 except Exception:
-    SERVER_VERSION = "1.7.1"
+    SERVER_VERSION = "1.8.2"
+
+# Server and addon are released in lockstep from one repo (the VERSION file is
+# the single source of truth), so the addon this server pairs with is simply
+# its own version.
+EXPECTED_ADDON_VERSION = SERVER_VERSION
 
 # Only warn once per server process about an outdated addon
 _addon_outdated_warned = False
@@ -403,6 +405,10 @@ def get_scene_info(ctx: Context, user_prompt: str = "") -> str:
 
     Returns a quick summary capped at 20 objects - for full or filtered
     listings use get_scene_graph.
+
+    Includes file identity: "filepath" (the open .blend, null if never saved),
+    "file_saved" and "unsaved_changes". Check filepath before any file
+    operation (save/save_as/open/export) to confirm WHICH file is open.
 
     Parameters:
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
@@ -612,8 +618,10 @@ def get_scene_graph(
       meshes only), "modifiers", "mesh_stats" (vertex/polygon counts)
 
     Returns JSON: scene settings (frame range, fps, current frame, mode, active/selected
-    objects, render engine), a flat collections list, and per-object name/type/parent/
-    collections, location/rotation_euler/scale (meters/radians), dimensions, visibility,
+    objects, render engine), file identity ("filepath" - the open .blend, null if never
+    saved - plus "file_saved" and "unsaved_changes"; check filepath before any file
+    operation), a flat collections list, and per-object name/type/parent/collections,
+    location/rotation_euler/scale (meters/radians), dimensions, visibility,
     material slots and has_animation.
     """
     try:
@@ -2403,6 +2411,10 @@ def asset_creation_strategy() -> str:
     - execute_blender_code(..., rollback_on_error=True) automatically undoes a script that raised
 
     **Session continuity (assignment record)**
+    - Before any file operation or multi-step build: check get_scene_info's filepath to
+      confirm WHICH file is open - never assume. To work on a copy, prefer manage_project
+      save_as FIRST (from the currently open file) over open-then-save_as; avoid opening
+      different files mid-session unless required, and re-verify filepath afterward.
     - At the START of a session on an existing file, call manage_assignment(action="read")
       to pick up the assignment record (title, plan, decisions, log) cheaply.
     - Before any multi-step build, call manage_assignment(action="start", title=..., plan=[...]).
@@ -2554,6 +2566,12 @@ def production_strategy() -> str:
        folder (campaign.json), read it and the brand's video-brand-pack.json it
        references, and honor colors/title_pairs/fonts/logo guardrails in all
        titles and materials. Campaign workspace root: D:\\Dev\\VideoProduction.
+
+    0b. File identity: before any file operation or multi-step build, check
+       get_scene_info's filepath to confirm WHICH file is open - never assume.
+       To work on a copy, prefer manage_project save_as FIRST (from the
+       currently open file) over open-then-save_as; avoid opening different
+       files mid-session unless required, and re-verify filepath afterward.
 
     1. Format first: call get_delivery_presets(), then manage_sequence
        action="setup_timeline" with the TARGET preset (LINKEDIN_WIDE / SQUARE /

@@ -84,6 +84,12 @@ def main():
           version_file == pyproject_version == mod.ADDON_VERSION == bl_info_version,
           f"VERSION={version_file!r} pyproject={pyproject_version!r} "
           f"ADDON_VERSION={mod.ADDON_VERSION!r} bl_info={bl_info_version!r}")
+    with open(os.path.join(repo_root, "src", "blender_mcp", "server.py"),
+              encoding="utf-8") as f:
+        m = re.search(r'^\s*SERVER_VERSION\s*=\s*"([^"]+)"', f.read(), re.MULTILINE)
+    server_fallback = m.group(1) if m else None
+    check("server fallback version consistency", server_fallback == version_file,
+          f"server.py fallback={server_fallback!r} VERSION={version_file!r}")
 
     # --- ping / get_capabilities ---------------------------------------
     r = run("ping")
@@ -120,10 +126,21 @@ def main():
     check("get_scene_info keys",
           "objects" in r and "frame_start" in r and "fps" in r and "mode" in r,
           str(list(r.keys())))
+    check("get_scene_info file identity (unsaved)",
+          "filepath" in r and r.get("filepath") in (None, "")
+          and r.get("file_saved") is False
+          and isinstance(r.get("unsaved_changes"), bool),
+          str({k: r.get(k) for k in ("filepath", "file_saved", "unsaved_changes")}))
 
     r = run("get_scene_graph", include=["bounds", "mesh_stats"], limit=50)
     check("scene_graph scene block",
           isinstance(r.get("scene"), dict) and "engine" in r["scene"], str(r)[:300])
+    sblock = r.get("scene") or {}
+    check("scene_graph file identity (unsaved)",
+          "filepath" in sblock and sblock.get("filepath") in (None, "")
+          and sblock.get("file_saved") is False
+          and isinstance(sblock.get("unsaved_changes"), bool),
+          str({k: sblock.get(k) for k in ("filepath", "file_saved", "unsaved_changes")}))
     names = [o.get("name") for o in r.get("objects", [])]
     check("scene_graph has Cube", "Cube" in names, str(names))
     cube_entry = next((o for o in r.get("objects", []) if o.get("name") == "Cube"), {})
@@ -403,6 +420,22 @@ def main():
     check("manage_project save_as",
           r.get("ok") is True and os.path.exists(blend_path), str(r)[:300])
 
+    # File identity must now report the real saved path (v1.8.2)
+    def _same_path(a, b):
+        return os.path.normcase(os.path.normpath(str(a))) == \
+            os.path.normcase(os.path.normpath(str(b)))
+
+    r = run("get_scene_info")
+    check("get_scene_info file identity (saved)",
+          r.get("file_saved") is True and _same_path(r.get("filepath"), blend_path),
+          str({k: r.get(k) for k in ("filepath", "file_saved", "unsaved_changes")}))
+    r = run("get_scene_graph", limit=1)
+    sblock = r.get("scene") or {}
+    check("scene_graph file identity (saved)",
+          sblock.get("file_saved") is True
+          and _same_path(sblock.get("filepath"), blend_path),
+          str({k: sblock.get(k) for k in ("filepath", "file_saved", "unsaved_changes")}))
+
     # --- v1.8.1 panel output controls (save/version/render operators) ------
     # Operators register under RNA names derived from bl_idname:
     # 'blendermcp.save_now' -> bpy.types.BLENDERMCP_OT_save_now
@@ -655,6 +688,111 @@ def main():
     check("unknown command error",
           resp.get("status") == "error" and "Unknown command type" in str(resp.get("message")),
           str(resp)[:300])
+
+    # --- legacy MCP server detection + response notice (v1.8.2) ---------------
+    # Simulated legacy connection: client info never set, >1 command completed,
+    # responses run through _execute_command_internal and then injected the
+    # same way execute_wrapper does it.
+    lsrv = mod.BlenderMCPServer(port=9877)  # never started
+    check("legacy flag defaults off",
+          lsrv.legacy_client is False and lsrv._saw_client_info is False, "")
+    lsrv._update_legacy_detection(1)
+    check("legacy not flagged on first command", lsrv.legacy_client is False, "")
+    lsrv._update_legacy_detection(2)
+    check("legacy flagged after first completed command",
+          lsrv.legacy_client is True, "")
+
+    # Modern client (set_client_info received): never flagged, nothing injected
+    msrv = mod.BlenderMCPServer(port=9878)
+    msrv._execute_command_internal(
+        {"type": "set_client_info", "params": {"version": mod.ADDON_VERSION}})
+    msrv._update_legacy_detection(5)
+    check("modern client never flagged", msrv.legacy_client is False, "")
+    resp = msrv._inject_legacy_notice(
+        "execute_code",
+        {"status": "success", "result": {"executed": True, "stdout": "quiet"}})
+    check("modern client gets no notice",
+          "result" not in resp["result"] and "server_notice" not in resp["result"],
+          str(resp)[:300])
+
+    # Legacy execute_code: notice + stdout packed into a "result" key (the
+    # only field old servers forward: result.get("result", ""))
+    resp = lsrv._execute_command_internal(
+        {"type": "execute_code", "params": {"code": "print('legacy_stdout_probe')"}})
+    resp = lsrv._inject_legacy_notice("execute_code", resp)
+    res = resp.get("result", {})
+    check("legacy execute_code result key",
+          isinstance(res.get("result"), str)
+          and res["result"].startswith("[blender-mcp]")
+          and "outdated" in res["result"]
+          and "legacy_stdout_probe" in res["result"],
+          str(res.get("result"))[:300])
+    check("legacy execute_code new-shape keys intact",
+          res.get("executed") is True and "legacy_stdout_probe" in res.get("stdout", ""),
+          str(list(res.keys())))
+
+    # Throttle: the next 9 eligible commands carry no notice...
+    resp = lsrv._inject_legacy_notice(
+        "get_scene_info", {"status": "success", "result": {"name": "Scene"}})
+    check("legacy notice throttled", "server_notice" not in resp["result"],
+          str(resp)[:300])
+    # ...but execute_code stdout keeps being forwarded while throttled
+    resp = lsrv._inject_legacy_notice(
+        "execute_code", {"status": "success", "result": {"stdout": "still_visible"}})
+    check("legacy stdout forwarded while throttled",
+          resp["result"].get("result") == "still_visible", str(resp)[:300])
+    # every 10th eligible command gets the notice again
+    lsrv._legacy_notice_counter = 10
+    resp = lsrv._inject_legacy_notice(
+        "get_scene_info", {"status": "success", "result": {"name": "Scene"}})
+    check("legacy notice every 10 commands",
+          resp["result"].get("server_notice") == mod.LEGACY_SERVER_NOTICE,
+          str(resp)[:300])
+    # only passthrough command types are touched
+    resp = lsrv._inject_legacy_notice(
+        "get_scene_graph", {"status": "success", "result": {"scene": {}}})
+    check("legacy notice only for passthrough commands",
+          "server_notice" not in resp["result"] and "result" not in resp["result"],
+          str(resp)[:300])
+    # errors from executed code also reach legacy servers via the result field
+    lsrv._legacy_notice_counter = 1  # notice not due
+    resp = lsrv._execute_command_internal(
+        {"type": "execute_code", "params": {"code": "raise ValueError('legacy boom')"}})
+    resp = lsrv._inject_legacy_notice("execute_code", resp)
+    check("legacy execute_code error forwarded",
+          "legacy boom" in str(resp["result"].get("result", "")),
+          str(resp["result"].get("result"))[:300])
+
+    # --- load_post state resync handler (v1.8.2) -------------------------------
+    def _handler_count(handler_list, name):
+        return sum(1 for h in handler_list if getattr(h, "__name__", "") == name)
+
+    check("load_post registered once",
+          _handler_count(bpy.app.handlers.load_post, "_blendermcp_load_post") == 1,
+          str([getattr(h, "__name__", "?") for h in bpy.app.handlers.load_post]))
+
+    # The handler re-syncs the per-file scene prop to the ACTUAL server state
+    # (no server is running in this test)
+    bpy.context.scene.blendermcp_server_running = True  # lie, as a stale .blend would
+    mod._blendermcp_load_post()
+    check("load_post resyncs server_running",
+          bpy.context.scene.blendermcp_server_running is False,
+          f"prop={bpy.context.scene.blendermcp_server_running}")
+
+    # Survives a full unregister/register cycle without duplicating
+    mod.unregister()
+    mod.register()
+    try:
+        if hasattr(bpy.types, "blendermcp_server") and bpy.types.blendermcp_server:
+            bpy.types.blendermcp_server.stop()
+    except Exception:
+        pass
+    check("load_post survives re-register",
+          _handler_count(bpy.app.handlers.load_post, "_blendermcp_load_post") == 1,
+          str([getattr(h, "__name__", "?") for h in bpy.app.handlers.load_post]))
+    check("save_post survives re-register",
+          _handler_count(bpy.app.handlers.save_post, "_blendermcp_save_post") == 1,
+          str([getattr(h, "__name__", "?") for h in bpy.app.handlers.save_post]))
 
 
 if __name__ == "__main__":

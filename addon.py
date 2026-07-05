@@ -27,14 +27,26 @@ from contextlib import redirect_stdout, suppress
 bl_info = {
     "name": "Blender MCP",
     "author": "BlenderMCP",
-    "version": (1, 8, 1),
+    "version": (1, 8, 2),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > BlenderMCP",
     "description": "Connect Blender to Claude via MCP",
     "category": "Interface",
 }
 
-ADDON_VERSION = "1.8.1"
+ADDON_VERSION = "1.8.2"
+
+# Shown to agents talking through a legacy (pre-1.7.1 handshake) MCP server;
+# such servers drop stdout/errors from the new execute_code result shape.
+LEGACY_SERVER_NOTICE = (
+    "Your blender-mcp server is outdated for this addon: stdout/errors from "
+    "code execution are not forwarded by old servers. Ask the user to point "
+    "their MCP config at the current server (uvx --from <repo> blender-mcp)."
+)
+
+# Commands whose results legacy servers pass through to the agent as
+# text/json - the only responses where a compat notice can actually be seen.
+LEGACY_NOTICE_COMMANDS = ("execute_code", "get_scene_info", "get_object_info")
 
 RODIN_FREE_TRIAL_KEY = "vibecoding"
 
@@ -399,6 +411,34 @@ def _blendermcp_save_post(_dummy=None):
     except Exception as e:
         print(f"BlenderMCP: assignment sidecar refresh failed: {str(e)}")
 
+@bpy.app.handlers.persistent
+def _blendermcp_load_post(_dummy=None):
+    """Re-sync per-file panel state after any file load (manage_project open too).
+
+    The socket server lives on bpy.types and survives file loads, but
+    blendermcp_server_running is a per-scene property stored in the .blend -
+    after opening another file it can lie about the actual server state.
+    """
+    try:
+        server = getattr(bpy.types, "blendermcp_server", None)
+        running = bool(server and server.running)
+        scene = getattr(bpy.context, "scene", None)
+        if scene is not None:
+            try:
+                scene.blendermcp_server_running = running
+            except Exception:
+                pass
+        # Tag a redraw so the panel reflects the re-synced state
+        try:
+            for w in bpy.context.window_manager.windows:
+                for a in w.screen.areas:
+                    if a.type == 'VIEW_3D':
+                        a.tag_redraw()
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"BlenderMCP: load_post state resync failed: {str(e)}")
+
 def get_credential(context, pref_name, scene_prop_name):
     """Read an API credential.
 
@@ -450,6 +490,12 @@ class BlenderMCPServer:
         # MCP server (client) identity, reported via set_client_info handshake
         self.client_version = None
         self.client_name = None
+        # Legacy/unknown MCP server detection: modern servers (>= 1.7.1) call
+        # set_client_info right after connecting; legacy servers never do.
+        # Reset on every new connection and on set_client_info arrival.
+        self.legacy_client = False
+        self._saw_client_info = False
+        self._legacy_notice_counter = 0
         # Assignment token accounting (see manage_assignment / _assignment_tokens)
         self._assignment_token_base = None
         self._assignment_prior_tokens = 0
@@ -553,6 +599,10 @@ class BlenderMCPServer:
                     self.active_client = client
                     self.client_connected = True
                     self.client_address = f"{address[0]}:{address[1]}"
+                    # Fresh connection: legacy detection starts over
+                    self.legacy_client = False
+                    self._saw_client_info = False
+                    self._legacy_notice_counter = 0
                     self._redraw_ui()
 
                     # Handle client in a separate thread
@@ -621,6 +671,13 @@ class BlenderMCPServer:
                             response = None
                             try:
                                 response = self.execute_command(command)
+                                # Legacy MCP server detection + compat notice
+                                # (must run before the response is serialized)
+                                try:
+                                    self._update_legacy_detection(conn_stats["commands"])
+                                    response = self._inject_legacy_notice(cmd_type, response)
+                                except Exception:
+                                    pass
                                 response_json = json.dumps(response)
                                 try:
                                     payload = response_json.encode('utf-8')
@@ -891,11 +948,67 @@ class BlenderMCPServer:
         """
         self.client_version = version
         self.client_name = name
+        # Handshake received: this connection is a modern server, not legacy
+        self._saw_client_info = True
+        self.legacy_client = False
         return {
             "ok": True,
             "addon_version": ADDON_VERSION,
             "match": version == ADDON_VERSION,
         }
+
+    def _update_legacy_detection(self, commands_on_connection):
+        """Flag the connection as a legacy/unknown MCP server.
+
+        Modern servers (>= 1.7.1) send set_client_info right after connecting
+        (their second command, after get_capabilities). If at least one command
+        has already completed on this connection and no set_client_info was
+        received, the server predates the handshake.
+        """
+        if commands_on_connection >= 2 and not self._saw_client_info:
+            self.legacy_client = True
+
+    def _inject_legacy_notice(self, cmd_type, response):
+        """Make responses useful for agents behind legacy MCP servers.
+
+        Old servers pass through the results of execute_code, get_scene_info
+        and get_object_info, but for execute_code they only forward
+        result.get("result", "") in an f-string - a key the new execute_code
+        dict doesn't have, so agents see an empty string instead of stdout or
+        errors. For legacy clients we therefore:
+        - execute_code: ADD a "result" key packing captured stdout (and any
+          error summary), with the upgrade notice prepended when due. This
+          un-blinds agents on legacy servers.
+        - get_scene_info / get_object_info: add a "server_notice" key when due.
+        The notice is throttled to once every 10 eligible commands. New-shape
+        keys are left untouched, so modern servers are unaffected (they never
+        trigger legacy detection and would ignore the extra keys anyway).
+        """
+        if not self.legacy_client:
+            return response
+        if cmd_type not in LEGACY_NOTICE_COMMANDS:
+            return response
+        if not isinstance(response, dict) or not isinstance(response.get("result"), dict):
+            return response
+        result = response["result"]
+        notice_due = self._legacy_notice_counter % 10 == 0
+        self._legacy_notice_counter += 1
+        if cmd_type == "execute_code":
+            pieces = []
+            if notice_due:
+                pieces.append("[blender-mcp] " + LEGACY_SERVER_NOTICE)
+            stdout = result.get("stdout") or ""
+            if stdout:
+                pieces.append(stdout)
+            error = result.get("error")
+            if isinstance(error, dict) and error.get("message"):
+                pieces.append(
+                    f"[error] {error.get('type', 'Error')}: {error.get('message')}")
+            if pieces:
+                result["result"] = "\n".join(pieces)
+        elif notice_due:
+            result["server_notice"] = LEGACY_SERVER_NOTICE
+        return response
 
     def get_capabilities(self):
         """Report addon version, Blender version, integration toggles and available commands"""
@@ -953,6 +1066,11 @@ class BlenderMCPServer:
             # Simplify the scene info to reduce data size
             scene_info = {
                 "name": scene.name,
+                # File identity: which .blend is actually open (None if never saved).
+                # Agents must check this before any file operation.
+                "filepath": bpy.data.filepath or None,
+                "file_saved": bool(bpy.data.filepath),
+                "unsaved_changes": bpy.data.is_dirty,
                 "object_count": len(scene.objects),
                 "objects": [],
                 "materials_count": len(bpy.data.materials),
@@ -1117,6 +1235,11 @@ class BlenderMCPServer:
 
         scene_block = {
             "name": scene.name,
+            # File identity: which .blend is actually open (None if never saved).
+            # Agents must check this before any file operation.
+            "filepath": bpy.data.filepath or None,
+            "file_saved": bool(bpy.data.filepath),
+            "unsaved_changes": bpy.data.is_dirty,
             "frame_start": scene.frame_start,
             "frame_end": scene.frame_end,
             "fps": scene.render.fps,
@@ -6089,6 +6212,12 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
                 box.label(text="Paused - commands are rejected", icon='PAUSE')
             if server.client_connected and server.client_address:
                 box.label(text=f"Client connected: {server.client_address}", icon='LINKED')
+                if getattr(server, "legacy_client", False):
+                    row = box.row()
+                    row.alert = True
+                    row.label(
+                        text="Legacy/unknown MCP server connected — update server config (see README)",
+                        icon='ERROR')
             else:
                 box.label(text="Waiting for client...", icon='UNLINKED')
             if server.commands_executed:
@@ -6780,6 +6909,13 @@ def register():
             bpy.app.handlers.save_post.remove(h)
     bpy.app.handlers.save_post.append(_blendermcp_save_post)
 
+    # Re-sync per-file panel state after any file load (same double-append
+    # guard: match by name, the function object changes between addon loads)
+    for h in list(bpy.app.handlers.load_post):
+        if getattr(h, "__name__", "") == "_blendermcp_load_post":
+            bpy.app.handlers.load_post.remove(h)
+    bpy.app.handlers.load_post.append(_blendermcp_load_post)
+
     # Auto-start the server so the MCP client can connect without manual UI interaction
     scene = getattr(bpy.context, 'scene', None)
     if scene is not None:
@@ -6837,6 +6973,11 @@ def unregister():
     for h in list(bpy.app.handlers.save_post):
         if getattr(h, "__name__", "") == "_blendermcp_save_post":
             bpy.app.handlers.save_post.remove(h)
+
+    # Remove the file-load state resync handler (same by-name matching)
+    for h in list(bpy.app.handlers.load_post):
+        if getattr(h, "__name__", "") == "_blendermcp_load_post":
+            bpy.app.handlers.load_post.remove(h)
 
     bpy.utils.unregister_class(BLENDERMCP_PT_Panel)
     bpy.utils.unregister_class(BLENDERMCP_OT_SetFreeTrialHyper3DAPIKey)
