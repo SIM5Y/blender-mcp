@@ -287,7 +287,7 @@ try:
     from importlib.metadata import version as _pkg_version
     SERVER_VERSION = _pkg_version("blender-mcp")
 except Exception:
-    SERVER_VERSION = "1.8.4"
+    SERVER_VERSION = "1.8.5"
 
 # Server and addon are released in lockstep from one repo (the VERSION file is
 # the single source of truth), so the addon this server pairs with is simply
@@ -1227,6 +1227,7 @@ def render_animation_preview(
     num_frames: int = 6,
     max_size: int = 512,
     camera: str = None,
+    engine: str = None,
     user_prompt: str = ""
 ) -> list:
     """
@@ -1241,6 +1242,11 @@ def render_animation_preview(
       (default 6, max 10)
     - max_size: Image size cap in pixels (default 512)
     - camera: Camera object name; default the scene camera
+    - engine: None (default) uses the fast OpenGL path. Pass "EEVEE" for an
+      alpha-accurate render per frame - REQUIRED to verify keyframed material
+      Alpha / opacity fades and layered compositing (flat 2D, kinetic
+      typography). The fast path is alpha-blind and stacks overlapping layers,
+      so it misreads exactly that style of motion.
 
     Returns a text summary of the sampled frame numbers followed by one image per frame.
     """
@@ -1251,7 +1257,8 @@ def render_animation_preview(
             "frame_end": frame_end,
             "num_frames": num_frames,
             "max_size": max_size,
-            "camera": camera
+            "camera": camera,
+            "engine": engine
         })
         if "error" in result:
             raise Exception(result["error"])
@@ -1581,6 +1588,7 @@ def render_sequence(
     frame_end: int = None,
     container: str = "MPEG4",
     video_bitrate: int = None,
+    view_transform: str = "Standard",
     wait: bool = True,
     status_only: bool = False,
     user_prompt: str = ""
@@ -1594,6 +1602,11 @@ def render_sequence(
       omitted values keep the current scene settings.
     - frame_start / frame_end: encode range (defaults: scene range).
     - video_bitrate: kbps override (otherwise high-quality CRF).
+    - view_transform: color-management transform for the encode. Default
+      "Standard" (no tone-mapping) - correct for a VSE that muxes
+      already-finished footage/text, and avoids AgX/Filmic greying white
+      cards. Pass "AgX"/"Filmic" only when grading raw 3D scene strips in
+      the VSE; the scene's real transform is restored after the encode.
     - wait=True (default): renders synchronously and returns {filepath,
       size_bytes, frames, duration_seconds}. VSE encodes are near-realtime;
       suitable for clips up to ~90s at 1080p (every command must finish
@@ -1610,6 +1623,7 @@ def render_sequence(
         params = {"filepath": filepath, "preset": preset, "resolution": resolution,
                   "fps": fps, "frame_start": frame_start, "frame_end": frame_end,
                   "container": container, "video_bitrate": video_bitrate,
+                  "view_transform": view_transform,
                   "wait": wait, "status_only": status_only}
         params = {k: v for k, v in params.items() if v is not None}
         result = blender.send_command("render_sequence", params)
@@ -2671,13 +2685,19 @@ def production_strategy() -> str:
 
     6. Verify before encoding: keep total clip length 15-60 seconds for social.
        Check the returned "timeline" state after each edit, and use
-       render_animation_preview() to eyeball frames BEFORE a full encode.
+       render_animation_preview() to eyeball frames BEFORE a full encode. For
+       flat 2D / kinetic-typography work with keyframed Alpha or opacity fades,
+       pass engine="EEVEE" - the default fast preview is alpha-blind and stacks
+       layers, so it misreads that motion.
 
     7. Deliver per platform: render_sequence(filepath, preset=...) for each
        required format - WIDE / SQUARE / VERTICAL are separate renders: re-run
        setup_timeline with the next preset (strips keep their timing), then
-       render_sequence again. Use wait=True for clips up to ~90s; longer renders
-       need wait=False plus status_only=True polling (interactive Blender only).
+       render_sequence again. The encode defaults to view_transform="Standard"
+       (no AgX/Filmic tone-mapping), which is correct for muxing already-finished
+       footage and text; only override it when grading raw 3D scene strips. Use
+       wait=True for clips up to ~90s; longer renders need wait=False plus
+       status_only=True polling (interactive Blender only).
 
     8. Hand off: manage_project save, then manage_assignment action="handoff"
        recording delivered files and any remaining formats.

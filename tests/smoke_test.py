@@ -464,6 +464,25 @@ def main():
         check("render_animation_preview (env-lenient)", env_related,
               f"unexpected failure: {msg[:300]}")
 
+    # v1.8.5: engine="EEVEE" does a real per-frame render (alpha-accurate).
+    resp = server._execute_command_internal(
+        {"type": "render_animation_preview",
+         "params": {"num_frames": 2, "max_size": 128, "engine": "EEVEE"}})
+    if resp.get("status") == "success":
+        res = resp["result"]
+        check("render_animation_preview engine=EEVEE",
+              len(res.get("images", [])) == 2,
+              str(res.get("frames_sampled")))
+    else:
+        msg = str(resp.get("message", ""))
+        env_related = any(s in msg.lower() for s in ("opengl", "context", "gpu", "window"))
+        check("render_animation_preview engine=EEVEE (env-lenient)", env_related,
+              f"unexpected failure: {msg[:300]}")
+    # the engine switch must not leak: scene render engine is restored
+    check("render_animation_preview engine restored",
+          bpy.context.scene.render.engine != 'BLENDER_WORKBENCH',
+          f"engine={bpy.context.scene.render.engine}")
+
     r = run("render_image", resolution_x=128, resolution_y=128,
             engine="EEVEE", samples=8)
     check("render_image",
@@ -851,6 +870,7 @@ def main():
 
     # --- render_sequence: real FFMPEG encode over 12 frames ------------------
     mp4_path = os.path.join(tmpdir, "vse_smoke.mp4")
+    vt_before = scn.view_settings.view_transform
     r = run("render_sequence", filepath=mp4_path, resolution=[320, 320],
             frame_start=1, frame_end=12, wait=True)
     check("render_sequence mp4",
@@ -863,6 +883,11 @@ def main():
           and scn.frame_end == 48,
           f"res_x={scn.render.resolution_x} fmt={scn.render.image_settings.file_format} "
           f"frame_end={scn.frame_end}")
+    # v1.8.5: the encode forces Standard (no AgX greying) then restores the
+    # scene's real view transform.
+    check("render_sequence view_transform restored",
+          scn.view_settings.view_transform == vt_before,
+          f"before={vt_before} after={scn.view_settings.view_transform}")
 
     r = run("render_sequence", status_only=True)
     check("render_sequence status_only",

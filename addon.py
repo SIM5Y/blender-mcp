@@ -27,14 +27,14 @@ from contextlib import redirect_stdout, suppress
 bl_info = {
     "name": "Blender MCP",
     "author": "BlenderMCP",
-    "version": (1, 8, 4),
+    "version": (1, 8, 5),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > BlenderMCP",
     "description": "Connect Blender to Claude via MCP",
     "category": "Interface",
 }
 
-ADDON_VERSION = "1.8.4"
+ADDON_VERSION = "1.8.5"
 
 # Shown to agents talking through a legacy (pre-1.7.1 handshake) MCP server;
 # such servers drop stdout/errors from the new execute_code result shape.
@@ -3484,23 +3484,30 @@ class BlenderMCPServer:
         }
 
     def render_animation_preview(self, frame_start=None, frame_end=None, num_frames=6,
-                                 max_size=512, camera=None):
-        """OpenGL-render evenly sampled frames of the animation from the scene camera"""
+                                 max_size=512, camera=None, engine=None):
+        """Render evenly sampled frames of the animation from the scene camera
+        (fast OpenGL by default; engine="EEVEE" for an alpha-accurate render)"""
         job = self._render_animation_preview_prepare(
             frame_start=frame_start, frame_end=frame_end,
-            num_frames=num_frames, max_size=max_size, camera=camera)
+            num_frames=num_frames, max_size=max_size, camera=camera, engine=engine)
         return self._run_render_job_sync(job)
 
     def _render_animation_preview_prepare(self, frame_start=None, frame_end=None,
                                           num_frames=6, max_size=512, camera=None,
-                                          deferred=False):
+                                          engine=None, deferred=False):
         """Prepare an animation preview job: one sequential step per sampled
         frame (frame_set + single-frame render to a distinct temp file -
         never animation=True).
 
-        deferred=True (GUI path) renders through WORKBENCH instead of the
-        blocking OpenGL draw.
+        engine="EEVEE" does a real EEVEE render per frame so material alpha,
+        keyframed fades and compositing show correctly - essential for flat
+        2D / kinetic-typography clips, where the default fast OpenGL path
+        (WORKBENCH on the GUI/deferred path) is alpha-blind and stacks layers.
+        engine=None keeps the fast preview.
         """
+        accurate = bool(engine) and str(engine).upper() in (
+            "EEVEE", "EEVEE_NEXT", "BLENDER_EEVEE", "BLENDER_EEVEE_NEXT",
+            "MATERIAL", "ACCURATE")
         scene = bpy.context.scene
         frame_start = scene.frame_start if frame_start is None else int(frame_start)
         frame_end = scene.frame_end if frame_end is None else int(frame_end)
@@ -3528,7 +3535,12 @@ class BlenderMCPServer:
             render.resolution_percentage = 100
             render.image_settings.file_format = 'PNG'
             scene.camera = cam_obj
-            if deferred:
+            if accurate:
+                for candidate in ("BLENDER_EEVEE_NEXT", "BLENDER_EEVEE"):
+                    with suppress(Exception):
+                        render.engine = candidate
+                        break
+            elif deferred:
                 with suppress(Exception):
                     render.engine = 'BLENDER_WORKBENCH'
         except Exception:
@@ -3576,8 +3588,10 @@ class BlenderMCPServer:
             "animation": False,
             "frame_end": frames[-1],
             "steps": steps,
-            "sync_render": lambda: bpy.ops.render.opengl(
-                write_still=True, view_context=False),
+            "sync_render": (
+                (lambda: bpy.ops.render.render(write_still=True)) if accurate
+                else (lambda: bpy.ops.render.opengl(
+                    write_still=True, view_context=False))),
             "result": lambda: {"frames_sampled": frames, "images": images},
             "cleanup": _cleanup,
         }
@@ -4648,6 +4662,13 @@ class BlenderMCPServer:
         }
         if hasattr(render.image_settings, "media_type"):
             snap["media_type"] = render.image_settings.media_type
+        # Color management: VSE encodes finish already-composited pixels, so
+        # AgX/Filmic tone-mapping (the scene default) wrongly greys them. We
+        # force Standard for the encode and restore the scene's real transform.
+        with suppress(Exception):
+            vs = scene.view_settings
+            snap["view_transform"] = vs.view_transform
+            snap["look"] = vs.look
         with suppress(Exception):
             ff = render.ffmpeg
             snap["ffmpeg"] = {
@@ -4661,13 +4682,24 @@ class BlenderMCPServer:
         return snap
 
     @staticmethod
-    def _apply_ffmpeg_output_settings(container="MPEG4", video_bitrate=None):
+    def _apply_ffmpeg_output_settings(container="MPEG4", video_bitrate=None,
+                                      view_transform="Standard"):
         """Configure FFMPEG video output (container/codec/rate/sequencer).
 
         Shared by the render_sequence handler and the panel's Render Clip
         operator. Caller is responsible for snapshotting/restoring settings.
+
+        view_transform: color-management transform for the encode. Defaults to
+        "Standard" (no tone-mapping) because the VSE muxes already-finished
+        pixels; passing None leaves the scene's transform untouched.
         """
-        render = bpy.context.scene.render
+        scene = bpy.context.scene
+        render = scene.render
+        if view_transform:
+            with suppress(Exception):
+                scene.view_settings.view_transform = view_transform
+            with suppress(Exception):
+                scene.view_settings.look = 'None'
         if hasattr(render.image_settings, "media_type"):
             render.image_settings.media_type = 'VIDEO'  # 5.x gates FFMPEG on this
         render.image_settings.file_format = 'FFMPEG'
@@ -4717,6 +4749,12 @@ class BlenderMCPServer:
         if snap.get("use_sequencer") is not None:
             with suppress(Exception):
                 render.use_sequencer = snap["use_sequencer"]
+        if "view_transform" in snap:
+            with suppress(Exception):
+                scene.view_settings.view_transform = snap["view_transform"]
+        if "look" in snap:
+            with suppress(Exception):
+                scene.view_settings.look = snap["look"]
         with suppress(Exception):
             scene.frame_start = snap["frame_start"]
             scene.frame_end = snap["frame_end"]
@@ -4726,7 +4764,8 @@ class BlenderMCPServer:
 
     def _render_sequence_prepare(self, filepath=None, preset=None, resolution=None,
                                  fps=None, frame_start=None, frame_end=None,
-                                 container="MPEG4", video_bitrate=None):
+                                 container="MPEG4", video_bitrate=None,
+                                 view_transform="Standard"):
         """Validate + configure everything for a sequencer encode.
 
         Returns an info dict (normalized filepath, frames, fps, snapshot).
@@ -4760,7 +4799,8 @@ class BlenderMCPServer:
                 scene.frame_start = int(frame_start)
             if frame_end is not None:
                 scene.frame_end = int(frame_end)
-            self._apply_ffmpeg_output_settings(container, video_bitrate)
+            self._apply_ffmpeg_output_settings(container, video_bitrate,
+                                               view_transform)
             render.filepath = filepath
         except Exception:
             self._restore_vse_render_settings(snap)
@@ -4810,12 +4850,14 @@ class BlenderMCPServer:
                                           resolution=None, fps=None,
                                           frame_start=None, frame_end=None,
                                           container="MPEG4", video_bitrate=None,
+                                          view_transform="Standard",
                                           wait=True, status_only=False):
         """Prepare a deferred render_sequence job (GUI mode, wait=True)."""
         info = self._render_sequence_prepare(
             filepath=filepath, preset=preset, resolution=resolution, fps=fps,
             frame_start=frame_start, frame_end=frame_end,
-            container=container, video_bitrate=video_bitrate)
+            container=container, video_bitrate=video_bitrate,
+            view_transform=view_transform)
         scene = bpy.context.scene
         return {
             "kind": "render_sequence",
@@ -4833,7 +4875,8 @@ class BlenderMCPServer:
 
     def render_sequence(self, filepath=None, preset=None, resolution=None, fps=None,
                         frame_start=None, frame_end=None, container="MPEG4",
-                        video_bitrate=None, wait=True, status_only=False):
+                        video_bitrate=None, view_transform="Standard",
+                        wait=True, status_only=False):
         """Encode the sequencer timeline to a video file (see server tool docstring)"""
         if status_only:
             # on_complete is a callable owned by the deferred driver: never
@@ -4857,7 +4900,8 @@ class BlenderMCPServer:
         info = self._render_sequence_prepare(
             filepath=filepath, preset=preset, resolution=resolution, fps=fps,
             frame_start=frame_start, frame_end=frame_end,
-            container=container, video_bitrate=video_bitrate)
+            container=container, video_bitrate=video_bitrate,
+            view_transform=view_transform)
         snap = info["snapshot"]
         scene = bpy.context.scene
 
