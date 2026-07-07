@@ -287,7 +287,7 @@ try:
     from importlib.metadata import version as _pkg_version
     SERVER_VERSION = _pkg_version("blender-mcp")
 except Exception:
-    SERVER_VERSION = "1.8.5"
+    SERVER_VERSION = "1.8.6"
 
 # Server and addon are released in lockstep from one repo (the VERSION file is
 # the single source of truth), so the addon this server pairs with is simply
@@ -1329,6 +1329,73 @@ def render_image(
     except Exception as e:
         logger.error(f"Error rendering image: {str(e)}")
         raise Exception(f"Render failed: {str(e)}")
+
+@mcp.tool()
+@telemetry_tool("render_animation")
+def render_animation(
+    ctx: Context,
+    filepath: str,
+    frame_start: int = None,
+    frame_end: int = None,
+    resolution: List[int] = None,
+    engine: str = None,
+    samples: int = None,
+    camera: str = None,
+    dedup: bool = True,
+    file_format: str = "PNG",
+    user_prompt: str = ""
+) -> str:
+    """
+    Render the 3D scene animation through the camera to an image sequence,
+    rendering only UNIQUE frames and holding them across static spans.
+
+    Use this instead of a raw bpy animation render for anything that sits still
+    between beats - kinetic typography, lower-thirds, slates, any 2D/emission
+    clip. Held-frame dedup means render time scales with distinct frames, not
+    clip length: a 15s title card with 6 text beats renders ~6 frames, not 375.
+    The output sequence is still full length (rendered frames are copied across
+    their held spans), so it drops straight into the VSE.
+
+    Parameters:
+    - filepath: output DIRECTORY for the sequence (created if missing); frames
+      are written frame_0001.png, frame_0002.png, ...
+    - frame_start / frame_end: range to render; default the scene timeline
+    - resolution: [width, height]; default the scene's render resolution
+    - engine: "EEVEE" (fast, correct for flat 2D) or "CYCLES"; default scene engine
+    - samples: render samples (flat emission needs few, e.g. 1-16)
+    - camera: camera object name; default the scene camera
+    - dedup: hold identical frames (default True). Automatically disabled - and
+      every frame rendered - when the scene has drivers, physics/particle sims,
+      or animated image/movie textures, since those change per frame in ways the
+      fcurve fingerprint cannot see. The returned dedup_disabled_reasons says why.
+    - file_format: "PNG" (default) or "JPEG"
+
+    Returns JSON {output_dir, pattern, first_frame, frames, frames_rendered,
+    frames_deduplicated, dedup, dedup_disabled_reasons, engine, resolution}.
+    Then encode with manage_sequence add_media (point it at output_dir) +
+    render_sequence. All render settings are restored afterwards. GUI mode runs
+    the render non-blocking; very long renders may hit the ~170s command window,
+    so keep resolution/samples modest or split the range.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("render_animation", {
+            "filepath": filepath,
+            "frame_start": frame_start,
+            "frame_end": frame_end,
+            "resolution": resolution,
+            "engine": engine,
+            "samples": samples,
+            "camera": camera,
+            "dedup": dedup,
+            "file_format": file_format
+        })
+        if "error" in result:
+            raise Exception(result["error"])
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error rendering animation: {str(e)}")
+        return f"Error rendering animation: {str(e)}"
 
 @mcp.tool()
 @telemetry_tool("export_scene")
@@ -2670,6 +2737,12 @@ def production_strategy() -> str:
     2. Assemble the cut: add shot renders in story order with action="add_media"
        (movies import video only - audio is a separate add_media call). Let
        channel default to the next free channel; use set_strip to move/trim.
+       For a shot that IS a 3D scene animation (especially flat 2D / kinetic
+       typography that holds between beats), render it with render_animation -
+       it renders only unique frames and holds them, so a still-heavy title
+       card costs a few frames instead of hundreds - then add_media its
+       output_dir as an image sequence. Do NOT re-render such clips through a
+       full per-frame animation render.
 
     3. Cut to the beat: if a beat map JSON exists in the project folder, read it
        and place cuts and text on beat frames (frame = round(beat_time_seconds *

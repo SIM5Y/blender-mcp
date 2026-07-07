@@ -9,6 +9,7 @@
 # Integration/network commands and get_viewport_screenshot are NOT tested
 # (network access / real window required).
 
+import contextlib
 import importlib.util
 import os
 import re
@@ -489,6 +490,62 @@ def main():
           r.get("image_data") and r.get("width") == 128 and r.get("height") == 128,
           str({k: v for k, v in r.items() if k != 'image_data'})[:300])
 
+    # --- render_animation held-frame dedup (v1.8.6) ------------------------
+    # Hermetic setup: LINEAR motion on z over frames 1-10, then a flat hold
+    # 10-16 (equal keyframe values => constant curve). Prior tests deleted the
+    # Cube's location keys, so we own its animation state here.
+    run("set_keyframes", name="Cube", data_path="location", index=2,
+        interpolation="LINEAR",
+        keys=[{"frame": 1, "value": 0.0}, {"frame": 10, "value": 6.0},
+              {"frame": 16, "value": 6.0}])
+    # Planner: over the flat hold every frame is identical -> one render.
+    plan = server._plan_render_frames(10, 16, dedup=True)
+    check("render_animation dedup plan",
+          plan["dedup"] is True and plan["unique"] == 1
+          and plan["saved"] == 6 and plan["map"][13] == 10,
+          str({k: plan[k] for k in ("dedup", "unique", "saved")}))
+    # A range that spans LINEAR motion must keep the moving frames distinct.
+    plan2 = server._plan_render_frames(1, 10, dedup=True)
+    check("render_animation dedup keeps motion",
+          plan2["unique"] > 1 and plan2["map"][1] == 1,
+          str({k: plan2[k] for k in ("unique", "saved")}))
+    # Safety scan: a driver disables dedup (fingerprint can't see drivers).
+    cube = bpy.data.objects.get("Cube")
+    dref = None
+    try:
+        dref = cube.driver_add("scale", 0)
+        plan3 = server._plan_render_frames(10, 16, dedup=True)
+        check("render_animation dedup safety (driver)",
+              plan3["dedup"] is False and plan3["unique"] == 7
+              and any("driver" in s for s in plan3["reasons"]),
+              str({k: plan3[k] for k in ("dedup", "unique", "reasons")}))
+    finally:
+        if dref is not None:
+            with contextlib.suppress(Exception):
+                cube.driver_remove("scale", 0)
+    # dedup=False renders every frame regardless.
+    plan4 = server._plan_render_frames(10, 16, dedup=False)
+    check("render_animation dedup off", plan4["unique"] == 7 and not plan4["dedup"],
+          str({k: plan4[k] for k in ("dedup", "unique")}))
+    # End-to-end render to a sequence dir (env-lenient like the other renders).
+    anim_dir = os.path.join(tempfile.gettempdir(), f"blendermcp_anim_{os.getpid()}")
+    resp = server._execute_command_internal(
+        {"type": "render_animation",
+         "params": {"filepath": anim_dir, "frame_start": 10, "frame_end": 16,
+                    "resolution": [128, 128], "engine": "EEVEE", "samples": 4}})
+    if resp.get("status") == "success":
+        res = resp["result"]
+        n_files = len([f for f in os.listdir(anim_dir) if f.endswith(".png")])
+        check("render_animation sequence",
+              res.get("frames") == 7 and res.get("frames_rendered") == 1
+              and res.get("frames_deduplicated") == 6 and n_files == 7,
+              str(res)[:300])
+    else:
+        msg = str(resp.get("message", ""))
+        env_related = any(s in msg.lower() for s in ("opengl", "context", "gpu", "window"))
+        check("render_animation sequence (env-lenient)", env_related,
+              f"unexpected failure: {msg[:300]}")
+
     # --- assignment continuity (part 1: before the file is saved) ----------
     r = run("manage_assignment", action="read")
     check("assignment read empty", r.get("exists") is False, str(r)[:200])
@@ -705,7 +762,8 @@ def main():
     # --- GUI-safe deferred renders (v1.8.4; headless: routing only) ----------
     check("RENDER_DEFERRED_COMMANDS constant",
           mod.RENDER_DEFERRED_COMMANDS ==
-          {"render_image", "render_preview", "render_animation_preview"}
+          {"render_image", "render_preview", "render_animation_preview",
+           "render_animation"}
           and "get_viewport_screenshot" not in mod.RENDER_DEFERRED_COMMANDS,
           str(getattr(mod, "RENDER_DEFERRED_COMMANDS", None)))
     check("deferred routing: background stays synchronous",

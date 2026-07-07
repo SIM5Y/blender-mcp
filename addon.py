@@ -27,14 +27,14 @@ from contextlib import redirect_stdout, suppress
 bl_info = {
     "name": "Blender MCP",
     "author": "BlenderMCP",
-    "version": (1, 8, 5),
+    "version": (1, 8, 6),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > BlenderMCP",
     "description": "Connect Blender to Claude via MCP",
     "category": "Interface",
 }
 
-ADDON_VERSION = "1.8.5"
+ADDON_VERSION = "1.8.6"
 
 # Shown to agents talking through a legacy (pre-1.7.1 handshake) MCP server;
 # such servers drop stdout/errors from the new execute_code result shape.
@@ -164,6 +164,7 @@ RENDER_DEFERRED_COMMANDS = {
     "render_image",
     "render_preview",
     "render_animation_preview",
+    "render_animation",
 }
 RENDER_DEFERRED_POLL_SECONDS = 0.25
 # Answer before the MCP server's 180s socket timeout closes the connection
@@ -1185,6 +1186,7 @@ class BlenderMCPServer:
             "render_preview": self.render_preview,
             "render_animation_preview": self.render_animation_preview,
             "render_image": self.render_image,
+            "render_animation": self.render_animation,
             # Pipeline
             "export_scene": self.export_scene,
             "import_local_asset": self.import_local_asset,
@@ -3114,6 +3116,8 @@ class BlenderMCPServer:
             return self._render_preview_prepare(deferred=True, **params)
         if cmd_type == "render_animation_preview":
             return self._render_animation_preview_prepare(deferred=True, **params)
+        if cmd_type == "render_animation":
+            return self._render_animation_prepare(deferred=True, **params)
         if cmd_type == "render_sequence":
             return self._render_sequence_deferred_prepare(**params)
         raise ValueError(f"Command '{cmd_type}' is not a deferred render command.")
@@ -3684,6 +3688,281 @@ class BlenderMCPServer:
                                "format": fmt, "width": res_x, "height": res_y},
             "cleanup": _cleanup,
         }
+
+    # ------------------------------------------------------------------
+    # Full-animation render with held-frame dedup (v1.8.6)
+    # ------------------------------------------------------------------
+    # Flat 2D / kinetic-typography clips sit still between beats, yet a naive
+    # animation render re-renders every identical frame through the full 3D
+    # engine. render_animation renders only the UNIQUE frames and copies each
+    # rendered frame across its held span, so the output sequence is full
+    # length while render time scales with distinct frames, not duration.
+    #
+    # Dedup fingerprints fcurve values only. Any per-frame animation source it
+    # cannot see (drivers, physics/particle sims, animated image/movie
+    # textures) makes a "static" verdict unsafe, so the safety scan disables
+    # dedup and every frame is rendered. Correct-by-construction: dedup only
+    # ever engages on pure-fcurve scenes, which is exactly the target case.
+
+    @staticmethod
+    def _iter_scene_fcurves():
+        """Every fcurve that can drive the look, across all actions
+        (handles slotted/layered actions on 4.4+/5.x)."""
+        fcurves = []
+        for action in bpy.data.actions:
+            fcurves.extend(BlenderMCPServer._action_fcurves(action))
+        return fcurves
+
+    @staticmethod
+    def _has_drivers(id_block):
+        ad = getattr(id_block, "animation_data", None)
+        try:
+            return bool(ad and len(ad.drivers) > 0)
+        except Exception:
+            return False
+
+    # Modifier types whose result changes with the frame independently of any
+    # fcurve (simulation / time-dependent).
+    _SIM_MODIFIER_TYPES = {
+        'CLOTH', 'SOFT_BODY', 'FLUID', 'FLUID_SIMULATION', 'SMOKE',
+        'DYNAMIC_PAINT', 'OCEAN', 'EXPLODE', 'PARTICLE_SYSTEM', 'PARTICLE_INSTANCE',
+    }
+
+    def _dedup_safety_scan(self):
+        """Return (safe, reasons). Unsafe if any frame-dependent animation
+        source that fcurve fingerprinting can't see is present."""
+        reasons = []
+        scene = bpy.context.scene
+
+        def note(msg):
+            if msg not in reasons:
+                reasons.append(msg)
+
+        def scan_image_nodes(node_tree, where):
+            with suppress(Exception):
+                for node in node_tree.nodes:
+                    img = getattr(node, "image", None)
+                    src = getattr(img, "source", None)
+                    if src in ("SEQUENCE", "MOVIE"):
+                        note(f"animated image texture ({where})")
+
+        for obj in scene.objects:
+            if self._has_drivers(obj) or self._has_drivers(obj.data):
+                note("driver-animated object property")
+            with suppress(Exception):
+                for mod in obj.modifiers:
+                    if mod.type in self._SIM_MODIFIER_TYPES:
+                        note(f"simulation modifier ({mod.type})")
+            with suppress(Exception):
+                if len(obj.particle_systems) > 0:
+                    note("particle system")
+            with suppress(Exception):
+                for slot in obj.material_slots:
+                    mat = slot.material
+                    if mat is None:
+                        continue
+                    if self._has_drivers(mat):
+                        note("driver-animated material")
+                    if getattr(mat, "use_nodes", False) and mat.node_tree:
+                        if self._has_drivers(mat.node_tree):
+                            note("driver-animated material node")
+                        scan_image_nodes(mat.node_tree, "material")
+
+        world = scene.world
+        if world is not None:
+            if self._has_drivers(world):
+                note("driver-animated world")
+            if getattr(world, "use_nodes", False) and world.node_tree:
+                scan_image_nodes(world.node_tree, "world")
+        if self._has_drivers(scene):
+            note("driver-animated scene property")
+        with suppress(Exception):
+            if scene.use_nodes and scene.node_tree and self._has_drivers(scene.node_tree):
+                note("driver-animated compositor")
+
+        return (len(reasons) == 0, reasons)
+
+    @staticmethod
+    def _frame_fingerprint(frame, fcurves):
+        """A hashable snapshot of every fcurve's value at `frame`. Equal
+        fingerprints on consecutive frames => identical render."""
+        vals = []
+        for fc in fcurves:
+            try:
+                vals.append(round(fc.evaluate(frame), 5))
+            except Exception:
+                vals.append(None)
+        return tuple(vals)
+
+    def _plan_render_frames(self, frame_start, frame_end, dedup=True):
+        """Map every frame in [start, end] to the frame that should be rendered
+        for it. With dedup, runs of identical fcurve state share one render."""
+        frames = list(range(frame_start, frame_end + 1))
+        safe, reasons = (True, [])
+        if dedup:
+            safe, reasons = self._dedup_safety_scan()
+        if not dedup or not safe:
+            return {
+                "frames": frames, "total": len(frames),
+                "unique_frames": list(frames), "map": {f: f for f in frames},
+                "unique": len(frames), "saved": 0,
+                "dedup": False, "reasons": reasons,
+            }
+        fcurves = self._iter_scene_fcurves()
+        unique, fmap = [], {}
+        # fingerprints are always tuples, so None is a safe "no previous" mark
+        prev_fp, rep = None, None
+        for f in frames:
+            fp = self._frame_fingerprint(f, fcurves)
+            if fp != prev_fp:
+                rep, prev_fp = f, fp
+                unique.append(f)
+            fmap[f] = rep
+        return {
+            "frames": frames, "total": len(frames),
+            "unique_frames": unique, "map": fmap,
+            "unique": len(unique), "saved": len(frames) - len(unique),
+            "dedup": True, "reasons": [],
+        }
+
+    def _render_animation_prepare(self, filepath=None, frame_start=None,
+                                  frame_end=None, resolution=None, engine=None,
+                                  samples=None, camera=None, dedup=True,
+                                  file_format="PNG", deferred=False):
+        """Prepare a full-animation render job: one step per UNIQUE frame, then
+        copy each rendered frame across its held span."""
+        if not filepath:
+            raise ValueError(
+                "filepath is required - a directory for the PNG sequence "
+                "(e.g. 'C:/renders/shot/').")
+        scene = bpy.context.scene
+        fs = scene.frame_start if frame_start is None else int(frame_start)
+        fe = scene.frame_end if frame_end is None else int(frame_end)
+        if fe < fs:
+            fs, fe = fe, fs
+        if fe - fs + 1 > 100000:
+            raise ValueError("Frame range is too large (>100000 frames).")
+
+        fmt = str(file_format).upper().lstrip(".")
+        if fmt in ("JPG", "JPEG"):
+            file_format, ext = "JPEG", "jpg"
+        elif fmt == "PNG":
+            file_format, ext = "PNG", "png"
+        else:
+            raise ValueError(f"Invalid file_format '{file_format}'. Use 'PNG' or 'JPEG'.")
+
+        cam_obj = self._resolve_render_camera(camera)
+        out_dir = os.path.abspath(bpy.path.abspath(str(filepath)))
+        os.makedirs(out_dir, exist_ok=True)
+        stem = "frame_"
+
+        def slot(f):
+            return os.path.join(out_dir, f"{stem}{f:04d}.{ext}")
+
+        plan = self._plan_render_frames(fs, fe, dedup=dedup)
+
+        snap = self._snapshot_render_settings()
+        try:
+            render = scene.render
+            if engine is not None:
+                wanted = str(engine).upper()
+                if wanted in ("EEVEE", "BLENDER_EEVEE", "BLENDER_EEVEE_NEXT"):
+                    candidates = ["BLENDER_EEVEE_NEXT", "BLENDER_EEVEE"]
+                else:
+                    candidates = [wanted]
+                for candidate in candidates:
+                    try:
+                        render.engine = candidate
+                        break
+                    except Exception:
+                        continue
+                else:
+                    raise ValueError(
+                        f"Render engine '{engine}' is not available. Use 'CYCLES' or 'EEVEE'.")
+            if samples is not None:
+                samples = int(samples)
+                if render.engine == 'CYCLES':
+                    if hasattr(scene, "cycles") and hasattr(scene.cycles, "samples"):
+                        scene.cycles.samples = samples
+                elif hasattr(scene, "eevee") and hasattr(scene.eevee, "taa_render_samples"):
+                    scene.eevee.taa_render_samples = samples
+            if resolution is not None:
+                render.resolution_x = max(16, min(int(resolution[0]), 7680))
+                render.resolution_y = max(16, min(int(resolution[1]), 7680))
+            render.resolution_percentage = 100
+            render.image_settings.file_format = file_format
+            scene.camera = cam_obj
+        except Exception:
+            self._restore_render_settings(snap)
+            raise
+
+        steps = []
+        for f in plan["unique_frames"]:
+            def _setup(f=f):
+                scene.frame_set(f)
+                scene.render.filepath = slot(f)
+
+            def _collect(fp, f=f):
+                if not os.path.exists(slot(f)):
+                    raise FileNotFoundError(
+                        f"frame {f} did not write to {slot(f)}")
+
+            steps.append({"setup": _setup, "filepath": slot(f),
+                          "collect": _collect, "frame": f})
+
+        def _result():
+            # Fill held frames by copying each representative across its span.
+            copied = 0
+            for f in plan["frames"]:
+                rep = plan["map"][f]
+                if rep == f:
+                    continue
+                src, dst = slot(rep), slot(f)
+                if not os.path.exists(src):
+                    raise FileNotFoundError(f"representative frame missing: {src}")
+                shutil.copyfile(src, dst)
+                copied += 1
+            return {
+                "output_dir": out_dir,
+                "pattern": os.path.join(out_dir, f"{stem}####.{ext}"),
+                "first_frame": slot(fs),
+                "frame_start": fs,
+                "frame_end": fe,
+                "frames": plan["total"],
+                "frames_rendered": plan["unique"],
+                "frames_deduplicated": plan["saved"],
+                "held_frames_written": copied,
+                "dedup": plan["dedup"],
+                "dedup_disabled_reasons": plan["reasons"],
+                "engine": scene.render.engine,
+                "resolution": [render.resolution_x, render.resolution_y],
+                "note": ("Import as an image sequence with manage_sequence "
+                         "add_media (point filepath at output_dir or first_frame), "
+                         "then render_sequence to encode."),
+            }
+
+        return {
+            "kind": "render_animation",
+            "animation": False,
+            "frame_end": plan["unique_frames"][-1] if plan["unique_frames"] else fe,
+            "progress_filepath": out_dir,
+            "steps": steps,
+            "sync_render": lambda: bpy.ops.render.render(write_still=True),
+            "result": _result,
+            "cleanup": lambda: self._restore_render_settings(snap),
+        }
+
+    def render_animation(self, filepath=None, frame_start=None, frame_end=None,
+                         resolution=None, engine=None, samples=None, camera=None,
+                         dedup=True, file_format="PNG"):
+        """Render the scene animation to a PNG/JPEG sequence with held-frame
+        dedup (background/sync path; GUI mode routes through the deferred
+        driver). See the server tool docstring."""
+        job = self._render_animation_prepare(
+            filepath=filepath, frame_start=frame_start, frame_end=frame_end,
+            resolution=resolution, engine=engine, samples=samples, camera=camera,
+            dedup=dedup, file_format=file_format)
+        return self._run_render_job_sync(job)
 
     # ------------------------------------------------------------------
     # Pipeline handlers (C4)

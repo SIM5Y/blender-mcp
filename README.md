@@ -20,7 +20,7 @@ Give feedback, get inspired, and build on top of the MCP: [Discord](https://disc
 
 [Support this project](https://github.com/sponsors/ahujasid)
 
-## Current version(1.7.1)
+## Current version(1.8.6)
 - Structured tools for modelling, animation, cameras, rendering, and export — no hand-written Python needed for common operations
 - REPL-style code execution with persistent namespace, scene diffs, and optional rollback on error
 - Undo checkpoints before every AI mutation, plus an "Undo AI Action" button in the Blender panel
@@ -51,7 +51,7 @@ For the current version and changelog, see the [releases page](https://github.co
 - **Two-way communication**: Connect Claude AI to Blender through a socket-based server
 - **Structured modelling tools**: Transform and place objects, manage modifiers, boolean operations, collections, parenting
 - **Animation tools**: Timeline control, keyframes, interpolation/easing, animation introspection
-- **Cameras & rendering**: Camera framing and presets, multi-angle previews, animation previews, full renders
+- **Cameras & rendering**: Camera framing and presets, multi-angle previews, animation previews, full renders, and dedup-aware animation-sequence rendering (`render_animation` renders only unique frames and holds them — a still-heavy 2D/kinetic-typography clip costs a few frames instead of hundreds)
 - **Scene inspection**: Filterable, paginated scene graph plus detailed per-object info
 - **Code execution**: Run arbitrary Python code in Blender with REPL semantics, scene diffs, and rollback on error
 - **Pipeline**: Export (glTF/FBX/OBJ/USD), import local assets, save/version .blend projects
