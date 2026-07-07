@@ -27,14 +27,14 @@ from contextlib import redirect_stdout, suppress
 bl_info = {
     "name": "Blender MCP",
     "author": "BlenderMCP",
-    "version": (1, 8, 6),
+    "version": (1, 8, 7),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > BlenderMCP",
     "description": "Connect Blender to Claude via MCP",
     "category": "Interface",
 }
 
-ADDON_VERSION = "1.8.6"
+ADDON_VERSION = "1.8.7"
 
 # Shown to agents talking through a legacy (pre-1.7.1 handshake) MCP server;
 # such servers drop stdout/errors from the new execute_code result shape.
@@ -165,6 +165,7 @@ RENDER_DEFERRED_COMMANDS = {
     "render_preview",
     "render_animation_preview",
     "render_animation",
+    "preview_sequence",
 }
 RENDER_DEFERRED_POLL_SECONDS = 0.25
 # Answer before the MCP server's 180s socket timeout closes the connection
@@ -1187,6 +1188,7 @@ class BlenderMCPServer:
             "render_animation_preview": self.render_animation_preview,
             "render_image": self.render_image,
             "render_animation": self.render_animation,
+            "preview_sequence": self.preview_sequence,
             # Pipeline
             "export_scene": self.export_scene,
             "import_local_asset": self.import_local_asset,
@@ -3049,6 +3051,9 @@ class BlenderMCPServer:
             snap["shading_type"] = scene.display.shading.type
         except Exception:
             pass
+        snap["use_sequencer"] = getattr(render, "use_sequencer", None)
+        with suppress(Exception):
+            snap["view_transform"] = scene.view_settings.view_transform
         return snap
 
     @staticmethod
@@ -3079,6 +3084,12 @@ class BlenderMCPServer:
         if "shading_type" in snap:
             with suppress(Exception):
                 scene.display.shading.type = snap["shading_type"]
+        if snap.get("use_sequencer") is not None:
+            with suppress(Exception):
+                render.use_sequencer = snap["use_sequencer"]
+        if "view_transform" in snap:
+            with suppress(Exception):
+                scene.view_settings.view_transform = snap["view_transform"]
         with suppress(Exception):
             if scene.frame_current != snap["frame_current"]:
                 scene.frame_set(snap["frame_current"])
@@ -3118,6 +3129,8 @@ class BlenderMCPServer:
             return self._render_animation_preview_prepare(deferred=True, **params)
         if cmd_type == "render_animation":
             return self._render_animation_prepare(deferred=True, **params)
+        if cmd_type == "preview_sequence":
+            return self._preview_sequence_prepare(deferred=True, **params)
         if cmd_type == "render_sequence":
             return self._render_sequence_deferred_prepare(**params)
         raise ValueError(f"Command '{cmd_type}' is not a deferred render command.")
@@ -3965,6 +3978,102 @@ class BlenderMCPServer:
         return self._run_render_job_sync(job)
 
     # ------------------------------------------------------------------
+    # VSE composite preview (v1.8.7)
+    # ------------------------------------------------------------------
+    # render_image / render_animation_preview render the 3D SCENE camera, not
+    # the sequencer. preview_sequence renders the composited VSE output at a
+    # few frames so the agent can SEE the assembled 2D clip (text, bars,
+    # backgrounds, transitions) while building - instead of running a full
+    # render_sequence encode just to look. Standard view transform (finished
+    # pixels), timeline aspect preserved.
+
+    def _preview_sequence_prepare(self, frames=None, num_frames=6, max_size=512,
+                                  deferred=False):
+        scene = bpy.context.scene
+        self._get_sequence_editor()
+        fs, fe = scene.frame_start, scene.frame_end
+        if frames:
+            sample = sorted({int(f) for f in frames})[:12]
+        else:
+            num = max(1, min(int(num_frames), 12))
+            if num == 1 or fe == fs:
+                sample = [fs]
+            else:
+                span = fe - fs
+                sample = sorted({fs + int(round(span * i / (num - 1)))
+                                 for i in range(num)})
+        size = max(64, min(int(max_size), 2048))
+
+        snap = self._snapshot_render_settings()
+        try:
+            render = scene.render
+            res_x = max(1, render.resolution_x)
+            res_y = max(1, render.resolution_y)
+            pct = max(1, min(100, int(round(100 * size / max(res_x, res_y)))))
+            render.resolution_percentage = pct
+            render.image_settings.file_format = 'PNG'
+            if hasattr(render, "use_sequencer"):
+                render.use_sequencer = True
+            with suppress(Exception):
+                scene.view_settings.view_transform = 'Standard'
+            eff_x = max(1, int(res_x * pct / 100))
+            eff_y = max(1, int(res_y * pct / 100))
+        except Exception:
+            self._restore_render_settings(snap)
+            raise
+
+        images = []
+        temp_files = []
+        steps = []
+        stamp = int(time.time() * 1000)
+        for i, frame in enumerate(sample):
+            filepath = os.path.join(
+                tempfile.gettempdir(),
+                f"blendermcp_seqprev_{os.getpid()}_{stamp}_{i}.png")
+            temp_files.append(filepath)
+
+            def _setup(frame=frame, filepath=filepath):
+                scene.frame_set(frame)
+                scene.render.filepath = filepath
+
+            def _collect(fp, frame=frame):
+                with open(fp, "rb") as f:
+                    images.append({
+                        "frame": frame,
+                        "image_data": base64.b64encode(f.read()).decode("utf-8"),
+                        "format": "png",
+                        "width": eff_x,
+                        "height": eff_y,
+                    })
+
+            steps.append({"setup": _setup, "filepath": filepath,
+                          "collect": _collect, "frame": frame})
+
+        def _cleanup():
+            for filepath in temp_files:
+                with suppress(Exception):
+                    if os.path.exists(filepath):
+                        os.remove(filepath)
+            self._restore_render_settings(snap)
+
+        return {
+            "kind": "preview_sequence",
+            "animation": False,
+            "frame_end": sample[-1] if sample else fe,
+            "steps": steps,
+            "sync_render": lambda: bpy.ops.render.render(write_still=True),
+            "result": lambda: {"frames_sampled": sample, "images": images},
+            "cleanup": _cleanup,
+        }
+
+    def preview_sequence(self, frames=None, num_frames=6, max_size=512):
+        """Render the composited VSE timeline at sampled frames (see server
+        tool docstring)."""
+        job = self._preview_sequence_prepare(
+            frames=frames, num_frames=num_frames, max_size=max_size)
+        return self._run_render_job_sync(job)
+
+    # ------------------------------------------------------------------
     # Pipeline handlers (C4)
     # ------------------------------------------------------------------
 
@@ -4650,7 +4759,9 @@ class BlenderMCPServer:
                 "strip": self._strip_summary(strip)}
 
     def _vse_add_text(self, text, frame_start, duration, channel, size, color,
-                      position, font_path, name):
+                      position, font_path, name, bold=False, box=False,
+                      box_color=None, outline=False, outline_color=None,
+                      shadow=True):
         if not text:
             raise ValueError("add_text requires text.")
         position = str(position or "BOTTOM").upper()
@@ -4678,8 +4789,28 @@ class BlenderMCPServer:
         with suppress(Exception):
             strip.anchor_x = 'CENTER'
             strip.anchor_y = position
+        with suppress(Exception):
+            strip.use_bold = bool(bold)
+        # Shadow: on by default for legibility over any footage; toggleable.
         if hasattr(strip, "use_shadow"):
-            strip.use_shadow = True  # legibility over any footage
+            with suppress(Exception):
+                strip.use_shadow = bool(shadow)
+        # Background box: the standard for caption/lower-third legibility.
+        if box and hasattr(strip, "use_box"):
+            with suppress(Exception):
+                strip.use_box = True
+            if box_color is not None and hasattr(strip, "box_color"):
+                bc = list(box_color) + [1.0] * (4 - len(list(box_color)))
+                with suppress(Exception):
+                    strip.box_color = bc[:4]
+        # Outline: crisp edge on busy backgrounds.
+        if outline and hasattr(strip, "use_outline"):
+            with suppress(Exception):
+                strip.use_outline = True
+            if outline_color is not None and hasattr(strip, "outline_color"):
+                oc = list(outline_color) + [1.0] * (4 - len(list(outline_color)))
+                with suppress(Exception):
+                    strip.outline_color = oc[:4]
         warning = None
         if font_path:
             try:
@@ -4692,6 +4823,24 @@ class BlenderMCPServer:
         if warning:
             result["warning"] = warning
         return result
+
+    def _vse_add_color(self, color, frame_start, duration, channel, name):
+        """Add a solid COLOR strip - backgrounds, bars, lower-third boxes -
+        without importing a PNG. color is [r,g,b] (0-1)."""
+        frame_start = int(frame_start if frame_start is not None else 1)
+        duration = max(1, int(duration if duration is not None else 96))
+        se = self._get_sequence_editor()
+        col = self._seq_collection(se)
+        if channel is None:
+            channel = self._next_free_channel(se, frame_start, frame_start + duration)
+        strip = self._new_effect_strip(
+            col, name or "Color", 'COLOR', channel, frame_start, duration)
+        if color is not None:
+            rgb = [float(c) for c in list(color)[:3]]
+            if len(rgb) == 3:
+                with suppress(Exception):
+                    strip.color = rgb
+        return {"action": "add_color", "strip": self._strip_summary(strip)}
 
     def _vse_add_transition(self, strip_a, strip_b, transition_type, duration):
         if not strip_a or not strip_b:
@@ -4887,7 +5036,9 @@ class BlenderMCPServer:
                         duration=None, size=64, color=None, position="BOTTOM",
                         font_path=None, strip_a=None, strip_b=None, type=None,
                         strip_name=None, fade_type="IN", mute=None, volume=None,
-                        opacity=None, speed=None, end_frame=None, confirm=False):
+                        opacity=None, speed=None, end_frame=None, confirm=False,
+                        bold=False, box=False, box_color=None, outline=False,
+                        outline_color=None, shadow=True):
         """Composite video-sequence-editor handler (see server tool docstring)"""
         action = str(action).lower()
         if action == "list":
@@ -4898,7 +5049,12 @@ class BlenderMCPServer:
             result = self._vse_add_media(filepath, channel, frame_start, name, fit)
         elif action == "add_text":
             result = self._vse_add_text(text, frame_start, duration, channel, size,
-                                        color, position, font_path, name)
+                                        color, position, font_path, name,
+                                        bold=bold, box=box, box_color=box_color,
+                                        outline=outline, outline_color=outline_color,
+                                        shadow=shadow)
+        elif action == "add_color":
+            result = self._vse_add_color(color, frame_start, duration, channel, name)
         elif action == "add_transition":
             result = self._vse_add_transition(strip_a, strip_b, type, duration)
         elif action == "add_fade":

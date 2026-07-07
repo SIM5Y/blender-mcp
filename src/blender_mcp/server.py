@@ -287,7 +287,7 @@ try:
     from importlib.metadata import version as _pkg_version
     SERVER_VERSION = _pkg_version("blender-mcp")
 except Exception:
-    SERVER_VERSION = "1.8.6"
+    SERVER_VERSION = "1.8.7"
 
 # Server and addon are released in lockstep from one repo (the VERSION file is
 # the single source of truth), so the addon this server pairs with is simply
@@ -1280,6 +1280,62 @@ def render_animation_preview(
         raise Exception(f"Animation preview render failed: {str(e)}")
 
 @mcp.tool()
+@telemetry_tool("preview_sequence")
+def preview_sequence(
+    ctx: Context,
+    frames: List[int] = None,
+    num_frames: int = 6,
+    max_size: int = 512,
+    user_prompt: str = ""
+) -> list:
+    """
+    Render the COMPOSITED VSE timeline at a few frames so you can see the
+    assembled 2D clip while building it.
+
+    This is the sequencer analog of render_animation_preview: render_image and
+    render_animation_preview show the 3D scene camera, but this shows the VSE
+    output - text, color strips, media, transitions and fades all composited
+    together. Use it to check layout, timing and legibility BEFORE running a
+    full render_sequence encode, instead of encoding blind.
+
+    Parameters:
+    - frames: explicit frame numbers to preview (up to 12). If omitted, samples
+      num_frames evenly across the timeline (first and last included).
+    - num_frames: evenly spaced samples when `frames` is not given (default 6, max 12)
+    - max_size: longest-side cap in pixels (default 512); the timeline's aspect
+      ratio is preserved.
+
+    Rendered with view_transform Standard (no AgX greying) and all settings
+    restored afterwards. Returns a text summary of the sampled frames followed
+    by one composited image per frame.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("preview_sequence", {
+            "frames": frames,
+            "num_frames": num_frames,
+            "max_size": max_size
+        })
+        if "error" in result:
+            raise Exception(result["error"])
+        images = result.get("images", [])
+        if not images:
+            raise Exception("No sequence preview images were returned")
+        frames_sampled = result.get("frames_sampled") or [img.get("frame", "?") for img in images]
+        frame_order = ", ".join(str(f) for f in frames_sampled)
+        content: list = [f"VSE composite preview, frames in order: {frame_order}"]
+        for img in images:
+            _note_image_tokens(img.get("width"), img.get("height"))
+            content.append(Image(
+                data=base64.b64decode(img["image_data"]),
+                format=img.get("format", "png")
+            ))
+        return content
+    except Exception as e:
+        logger.error(f"Error previewing sequence: {str(e)}")
+        raise Exception(f"Sequence preview failed: {str(e)}")
+
+@mcp.tool()
 @telemetry_tool("render_image")
 def render_image(
     ctx: Context,
@@ -1594,6 +1650,12 @@ def manage_sequence(
     speed: float = None,
     end_frame: int = None,
     confirm: bool = False,
+    bold: bool = False,
+    box: bool = False,
+    box_color: List[float] = None,
+    outline: bool = False,
+    outline_color: List[float] = None,
+    shadow: bool = True,
     user_prompt: str = ""
 ) -> str:
     """
@@ -1610,7 +1672,15 @@ def manage_sequence(
       import VIDEO ONLY - to hear a movie's audio, call add_media again with
       the same filepath renamed to its audio, or add a separate audio file.
     - "add_text": text overlay; frame_start, duration (frames), size, color
-      [r,g,b,a], position BOTTOM|CENTER|TOP, optional font_path.
+      [r,g,b,a], position BOTTOM|CENTER|TOP, optional font_path. Styling for
+      legibility/brand: bold=True; shadow (default True); box=True with
+      box_color [r,g,b,a] for a caption/lower-third background plate;
+      outline=True with outline_color [r,g,b,a] for a crisp edge on busy
+      footage.
+    - "add_color": a solid COLOR strip - backgrounds (channel 1, full range),
+      bars, or lower-third boxes - without importing a PNG. color is [r,g,b]
+      (0-1); frame_start, duration, channel, name as usual. Faster and sharper
+      than a rendered plane for flat 2D.
     - "add_transition": strip_a + strip_b, type CROSS|WIPE, duration frames.
       Non-overlapping strips: strip_b is auto-shifted back (reported).
     - "add_fade": strip_name, fade_type IN|OUT|BOTH, duration frames
@@ -1635,7 +1705,9 @@ def manage_sequence(
                   "strip_a": strip_a, "strip_b": strip_b, "type": type,
                   "strip_name": strip_name, "fade_type": fade_type, "mute": mute,
                   "volume": volume, "opacity": opacity, "speed": speed,
-                  "end_frame": end_frame, "confirm": confirm}
+                  "end_frame": end_frame, "confirm": confirm, "bold": bold,
+                  "box": box, "box_color": box_color, "outline": outline,
+                  "outline_color": outline_color, "shadow": shadow}
         params = {k: v for k, v in params.items() if v is not None}
         result = blender.send_command("manage_sequence", params)
         return json.dumps(result, indent=2)
@@ -2757,11 +2829,14 @@ def production_strategy() -> str:
        action="add_fade" (IN on the first strip, OUT on the last, and on audio).
 
     6. Verify before encoding: keep total clip length 15-60 seconds for social.
-       Check the returned "timeline" state after each edit, and use
-       render_animation_preview() to eyeball frames BEFORE a full encode. For
-       flat 2D / kinetic-typography work with keyframed Alpha or opacity fades,
-       pass engine="EEVEE" - the default fast preview is alpha-blind and stacks
-       layers, so it misreads that motion.
+       Check the returned "timeline" state after each edit. To SEE the
+       assembled composite (text, color strips, media, transitions all layered)
+       use preview_sequence() - it renders the VSE output at sampled frames, so
+       you can check layout, timing and legibility instead of encoding blind.
+       (render_animation_preview shows the 3D SCENE camera, not the sequencer;
+       use it only for 3D scene motion, with engine="EEVEE" when material Alpha
+       or opacity fades must read correctly.) Backgrounds, bars and lower-third
+       plates are add_color strips or add_text box=True, not imported PNGs.
 
     7. Deliver per platform: render_sequence(filepath, preset=...) for each
        required format - WIDE / SQUARE / VERTICAL are separate renders: re-run

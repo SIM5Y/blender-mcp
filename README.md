@@ -20,7 +20,7 @@ Give feedback, get inspired, and build on top of the MCP: [Discord](https://disc
 
 [Support this project](https://github.com/sponsors/ahujasid)
 
-## Current version(1.8.6)
+## Current version(1.8.7)
 - Structured tools for modelling, animation, cameras, rendering, and export — no hand-written Python needed for common operations
 - REPL-style code execution with persistent namespace, scene diffs, and optional rollback on error
 - Undo checkpoints before every AI mutation, plus an "Undo AI Action" button in the Blender panel
@@ -55,7 +55,7 @@ For the current version and changelog, see the [releases page](https://github.co
 - **Scene inspection**: Filterable, paginated scene graph plus detailed per-object info
 - **Code execution**: Run arbitrary Python code in Blender with REPL semantics, scene diffs, and rollback on error
 - **Pipeline**: Export (glTF/FBX/OBJ/USD), import local assets, save/version .blend projects
-- **Video editing & delivery (VSE)**: Assemble rendered shots, text overlays, transitions and fades in the sequencer, then encode platform-preset deliverables (LinkedIn wide/square/vertical) — Blender as a complete production studio
+- **Video editing & delivery (VSE)**: Assemble rendered shots, styled text overlays (background box/outline/bold), solid color strips for backgrounds and bars, transitions and fades in the sequencer; preview the composited timeline at a glance (`preview_sequence`) before encoding platform-preset deliverables (LinkedIn wide/square/vertical) — Blender as a complete production studio
 - **Safety & control**: Undo checkpoints for AI actions, pause switch, and activity log in the Blender panel
 - **Budget hardening**: `batch_commands` runs up to 25 commands in one round-trip for step-metered clients, and every mutating session automatically leaves an assignment record on disconnect so work is always resumable
 

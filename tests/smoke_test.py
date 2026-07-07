@@ -763,7 +763,7 @@ def main():
     check("RENDER_DEFERRED_COMMANDS constant",
           mod.RENDER_DEFERRED_COMMANDS ==
           {"render_image", "render_preview", "render_animation_preview",
-           "render_animation"}
+           "render_animation", "preview_sequence"}
           and "get_viewport_screenshot" not in mod.RENDER_DEFERRED_COMMANDS,
           str(getattr(mod, "RENDER_DEFERRED_COMMANDS", None)))
     check("deferred routing: background stays synchronous",
@@ -925,6 +925,52 @@ def main():
           and isinstance(r.get("strips"), list)
           and r.get("duration_seconds") == round(48 / 25, 4),
           str({k: v for k, v in r.items() if k != 'strips'}))
+
+    # --- VSE 2D primitives + composite preview (v1.8.7) --------------------
+    # add_color: a solid COLOR strip (background/bar), no PNG import.
+    r = run("manage_sequence", action="add_color", color=[0.1, 0.2, 0.3],
+            frame_start=1, duration=48, channel=6, name="BG")
+    cstrip = r.get("strip") or {}
+    check("vse add_color",
+          cstrip.get("type") == "COLOR" and cstrip.get("channel") == 6,
+          str(r)[:300])
+    # add_text styling: box + outline + bold land on the strip.
+    r = run("manage_sequence", action="add_text", text="Styled", frame_start=5,
+            duration=30, position="CENTER", bold=True, box=True,
+            box_color=[0.0, 0.0, 0.0, 0.6], outline=True,
+            outline_color=[1.0, 1.0, 1.0, 1.0])
+    sname = (r.get("strip") or {}).get("name")
+    se = bpy.context.scene.sequence_editor
+    sstrip = next((s for s in server._seq_collection(se) if s.name == sname), None)
+    check("vse add_text styling",
+          sstrip is not None and getattr(sstrip, "use_box", False)
+          and getattr(sstrip, "use_outline", False)
+          and getattr(sstrip, "use_bold", False),
+          str({a: getattr(sstrip, a, None)
+               for a in ("use_box", "use_outline", "use_bold")} if sstrip else None))
+    # preview_sequence: render the composited VSE at sampled frames.
+    vt_pre = bpy.context.scene.view_settings.view_transform
+    pct_pre = bpy.context.scene.render.resolution_percentage
+    resp = server._execute_command_internal(
+        {"type": "preview_sequence", "params": {"num_frames": 2, "max_size": 128}})
+    if resp.get("status") == "success":
+        res = resp["result"]
+        check("preview_sequence",
+              len(res.get("images", [])) == 2
+              and len(res.get("frames_sampled", [])) == 2
+              and all(i.get("image_data") for i in res["images"]),
+              str(res.get("frames_sampled")))
+    else:
+        msg = str(resp.get("message", ""))
+        env_related = any(s in msg.lower() for s in ("opengl", "context", "gpu", "window"))
+        check("preview_sequence (env-lenient)", env_related,
+              f"unexpected failure: {msg[:300]}")
+    check("preview_sequence settings restored",
+          bpy.context.scene.view_settings.view_transform == vt_pre
+          and bpy.context.scene.render.resolution_percentage == pct_pre
+          and bpy.context.scene.render.image_settings.file_format != 'FFMPEG',
+          f"vt={bpy.context.scene.view_settings.view_transform} "
+          f"pct={bpy.context.scene.render.resolution_percentage}")
 
     # --- render_sequence: real FFMPEG encode over 12 frames ------------------
     mp4_path = os.path.join(tmpdir, "vse_smoke.mp4")
